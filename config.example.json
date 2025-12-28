@@ -1,0 +1,15 @@
+{
+  "update_interval_minutes": 30,
+  "bots": [
+    {
+      "bot_token": "",
+      "topgg_token": "",
+      "dbl_token": ""
+    },
+    {
+      "bot_token": "",
+      "topgg_token": "",
+      "dbl_token": ""
+    }
+  ]
+}

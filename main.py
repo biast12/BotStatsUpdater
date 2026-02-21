@@ -11,21 +11,12 @@ import json
 import asyncio
 import requests
 from typing import Optional, Dict, Any, List
-import logging
-from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import discord
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+from logger import BotLogger, LogLevel, LogArea
+logger = BotLogger.get_instance()
 
 
 class BotStatsUpdater:
@@ -63,7 +54,7 @@ class BotStatsUpdater:
             bool: True if successful, False otherwise
         """
         if not self.topgg_token:
-            logger.warning("Top.gg token not provided, skipping top.gg update")
+            logger.warning(LogArea.API, "Top.gg token not provided, skipping top.gg update")
             return False
 
         headers = {
@@ -83,12 +74,12 @@ class BotStatsUpdater:
         try:
             response = requests.post(self.topgg_url, json=payload, headers=headers)
             response.raise_for_status()
-            logger.info(f"Successfully updated top.gg stats: {server_count} servers")
+            logger.info(LogArea.API, f"Successfully updated top.gg stats: {server_count} servers")
             return True
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to update top.gg stats: {e}")
+            logger.error(LogArea.API, f"Failed to update top.gg stats: {e}")
             if hasattr(e.response, 'text'):
-                logger.error(f"Response: {e.response.text}")
+                logger.error(LogArea.API, f"Response: {e.response.text}")
             return False
 
     def update_dbl(self, guilds: int, users: Optional[int] = None,
@@ -107,7 +98,7 @@ class BotStatsUpdater:
             bool: True if successful, False otherwise
         """
         if not self.dbl_token:
-            logger.warning("DiscordBotList token not provided, skipping DBL update")
+            logger.warning(LogArea.API, "DiscordBotList token not provided, skipping DBL update")
             return False
 
         headers = {
@@ -129,12 +120,12 @@ class BotStatsUpdater:
         try:
             response = requests.post(self.dbl_url, json=payload, headers=headers)
             response.raise_for_status()
-            logger.info(f"Successfully updated discordbotlist.com stats: {guilds} guilds")
+            logger.info(LogArea.API, f"Successfully updated discordbotlist.com stats: {guilds} guilds")
             return True
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to update discordbotlist.com stats: {e}")
+            logger.error(LogArea.API, f"Failed to update discordbotlist.com stats: {e}")
             if hasattr(e.response, 'text'):
-                logger.error(f"Response: {e.response.text}")
+                logger.error(LogArea.API, f"Response: {e.response.text}")
             return False
 
     def update_all(self, server_count: int, users: Optional[int] = None,
@@ -156,7 +147,7 @@ class BotStatsUpdater:
         """
         results = {}
 
-        logger.info(f"Updating bot stats across all platforms...")
+        logger.info(LogArea.API, f"Updating bot stats across all platforms...")
 
         # Update top.gg
         results['topgg'] = self.update_topgg(
@@ -175,7 +166,7 @@ class BotStatsUpdater:
 
         successful = sum(1 for success in results.values() if success)
         total = len([k for k, v in results.items() if v is not None])
-        logger.info(f"Stats update complete: {successful}/{total} platforms updated successfully")
+        logger.info(LogArea.API, f"Stats update complete: {successful}/{total} platforms updated successfully")
 
         return results
 
@@ -201,13 +192,13 @@ class BotStatsManager:
         try:
             with open(self.config_path, 'r') as f:
                 config = json.load(f)
-                logger.info(f"Loaded configuration for {len(config.get('bots', []))} bot(s)")
+                logger.info(LogArea.CONFIG, f"Loaded configuration for {len(config.get('bots', []))} bot(s)")
                 return config
         except FileNotFoundError:
-            logger.error(f"Configuration file not found: {self.config_path}")
+            logger.error(LogArea.CONFIG, f"Configuration file not found: {self.config_path}")
             sys.exit(1)
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in configuration file: {e}")
+            logger.error(LogArea.CONFIG, f"Invalid JSON in configuration file: {e}")
             sys.exit(1)
 
     async def _create_bot_client(self, bot_config: Dict[str, Any]) -> discord.Client:
@@ -224,9 +215,9 @@ class BotStatsManager:
             if 'name' not in bot_config or not bot_config['name']:
                 bot_config['name'] = client.user.name
 
-            logger.info(f"Bot '{bot_config['name']}' ({client.user}) is ready!")
-            logger.info(f"  - Bot ID: {bot_config['bot_id']}")
-            logger.info(f"  - Guilds: {len(client.guilds)}")
+            logger.info(LogArea.BOT, f"Bot '{bot_config['name']}' ({client.user}) is ready!")
+            logger.info(LogArea.BOT, f"  - Bot ID: {bot_config['bot_id']}")
+            logger.info(LogArea.BOT, f"  - Guilds: {len(client.guilds)}")
 
         return client
 
@@ -235,7 +226,7 @@ class BotStatsManager:
         try:
             if not client.is_ready():
                 bot_name = bot_config.get('name', 'Unknown Bot')
-                logger.warning(f"Bot '{bot_name}' is not ready, skipping stats update")
+                logger.warning(LogArea.BOT, f"Bot '{bot_name}' is not ready, skipping stats update")
                 return
 
             # Auto-populate bot_id from client if not set
@@ -251,8 +242,8 @@ class BotStatsManager:
             user_count = 0  # Not tracking users
             voice_connections = 0  # Not tracking voice connections
 
-            logger.info(f"Updating stats for '{bot_config['name']}':")
-            logger.info(f"  - Guilds: {guild_count}")
+            logger.info(LogArea.API, f"Updating stats for '{bot_config['name']}':")
+            logger.info(LogArea.API, f"  - Guilds: {guild_count}")
 
             # Get or create updater for this bot
             bot_id = bot_config['bot_id']
@@ -273,17 +264,17 @@ class BotStatsManager:
             # Log results
             for platform, success in results.items():
                 status = "[OK]" if success else "[FAIL]"
-                logger.info(f"  {status} {platform}")
+                logger.info(LogArea.API, f"  {status} {platform}")
 
         except Exception as e:
             bot_name = bot_config.get('name', 'Unknown Bot')
-            logger.error(f"Error updating stats for '{bot_name}': {e}", exc_info=True)
+            logger.error(LogArea.API, f"Error updating stats for '{bot_name}': {e}")
 
     async def update_all_bots_stats(self):
         """Update stats for all configured bots"""
-        logger.info("=" * 60)
-        logger.info(f"Starting scheduled stats update at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info("=" * 60)
+        logger.spacer()
+        logger.info(LogArea.SCHEDULER, "Starting scheduled stats update")
+        logger.spacer()
 
         tasks = []
         for i, bot_config in enumerate(self.config['bots']):
@@ -292,13 +283,13 @@ class BotStatsManager:
 
         await asyncio.gather(*tasks)
 
-        logger.info("=" * 60)
-        logger.info("Stats update completed")
-        logger.info("=" * 60)
+        logger.spacer()
+        logger.info(LogArea.SCHEDULER, "Stats update completed")
+        logger.spacer()
 
     async def start(self):
         """Start all bots and the scheduler"""
-        logger.info("Starting Bot Stats Manager...")
+        logger.info(LogArea.STARTUP, "Starting Bot Stats Manager...")
 
         # Create and login all bots
         for bot_config in self.config['bots']:
@@ -313,10 +304,10 @@ class BotStatsManager:
                 await asyncio.sleep(2)
 
             except Exception as e:
-                logger.error(f"Failed to start bot '{bot_config['name']}': {e}", exc_info=True)
+                logger.error(LogArea.STARTUP, f"Failed to start bot '{bot_config['name']}': {e}")
 
         # Wait for all bots to be ready
-        logger.info("Waiting for all bots to be ready...")
+        logger.info(LogArea.STARTUP, "Waiting for all bots to be ready...")
         max_wait = 30  # seconds
         waited = 0
         while not all(bot.is_ready() for bot in self.bots) and waited < max_wait:
@@ -324,10 +315,10 @@ class BotStatsManager:
             waited += 1
 
         if not all(bot.is_ready() for bot in self.bots):
-            logger.warning("Not all bots are ready, but continuing anyway...")
+            logger.warning(LogArea.STARTUP, "Not all bots are ready, but continuing anyway...")
 
         # Do initial stats update
-        logger.info("Performing initial stats update...")
+        logger.info(LogArea.STARTUP, "Performing initial stats update...")
         await self.update_all_bots_stats()
 
         # Schedule periodic updates
@@ -341,27 +332,27 @@ class BotStatsManager:
         )
 
         self.scheduler.start()
-        logger.info(f"Scheduled stats updates every {interval_minutes} minutes")
-        logger.info("Bot Stats Manager is now running. Press Ctrl+C to stop.")
+        logger.info(LogArea.SCHEDULER, f"Scheduled stats updates every {interval_minutes} minutes")
+        logger.info(LogArea.STARTUP, "Bot Stats Manager is now running. Press Ctrl+C to stop.")
 
         # Keep running
         try:
             while True:
                 await asyncio.sleep(3600)  # Sleep for 1 hour
         except KeyboardInterrupt:
-            logger.info("Shutting down...")
+            logger.info(LogArea.SHUTDOWN, "Shutting down...")
             await self.stop()
 
     async def stop(self):
         """Stop all bots and the scheduler"""
-        logger.info("Stopping scheduler...")
+        logger.info(LogArea.SHUTDOWN, "Stopping scheduler...")
         self.scheduler.shutdown()
 
-        logger.info("Closing all bot connections...")
+        logger.info(LogArea.SHUTDOWN, "Closing all bot connections...")
         for bot in self.bots:
             await bot.close()
 
-        logger.info("Bot Stats Manager stopped.")
+        logger.info(LogArea.SHUTDOWN, "Bot Stats Manager stopped.")
 
 
 async def main():
@@ -369,8 +360,8 @@ async def main():
     config_file = "config.json"
 
     if not os.path.exists(config_file):
-        logger.error(f"Configuration file '{config_file}' not found!")
-        logger.info("Please create a config.json file with your bot configurations.")
+        logger.error(LogArea.CONFIG, f"Configuration file '{config_file}' not found!")
+        logger.info(LogArea.CONFIG, "Please create a config.json file with your bot configurations.")
         sys.exit(1)
 
     manager = BotStatsManager(config_file)
@@ -381,5 +372,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Received interrupt signal, shutting down...")
+        logger.info(LogArea.SHUTDOWN, "Received interrupt signal, shutting down...")
         sys.exit(0)

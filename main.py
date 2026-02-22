@@ -39,6 +39,8 @@ class BotStatsUpdater:
         # API endpoints
         self.topgg_stats_url = f"https://top.gg/api/bots/{bot_id}/stats"
         self.dbl_stats_url = f"https://discordbotlist.com/api/v1/bots/{bot_id}/stats"
+        self.topgg_commands_url = "https://top.gg/api/v1/projects/@me/commands"
+        self.dbl_commands_url   = f"https://discordbotlist.com/api/v1/bots/{bot_id}/commands"
 
     def update_topgg(self, server_count: int, shard_count: Optional[int] = None,
                      shard_id: Optional[int] = None) -> bool:
@@ -170,6 +172,97 @@ class BotStatsUpdater:
 
         return results
 
+    def sync_commands_topgg(self, commands: List[Dict[str, Any]]) -> bool:
+        """
+        Sync slash commands to top.gg
+
+        Args:
+            commands: List of command objects from Discord
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not self.topgg_token:
+            logger.warning(LogArea.API, "Top.gg token not provided, skipping top.gg commands sync")
+            return False
+        headers = {"Authorization": f"Bearer {self.topgg_token}", "Content-Type": "application/json"}
+        try:
+            response = requests.post(self.topgg_commands_url, json=commands, headers=headers)
+            response.raise_for_status()
+            logger.info(LogArea.API, f"Successfully synced {len(commands)} command(s) to top.gg")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(LogArea.API, f"Failed to sync commands to top.gg: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(LogArea.API, f"Response: {e.response.text}")
+            return False
+
+    def sync_commands_dbl(self, commands: List[Dict[str, Any]]) -> bool:
+        """
+        Sync slash commands to discordbotlist.com
+
+        Args:
+            commands: List of command objects from Discord
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not self.dbl_token:
+            logger.warning(LogArea.API, "DiscordBotList token not provided, skipping DBL commands sync")
+            return False
+        headers = {"Authorization": self.dbl_token, "Content-Type": "application/json"}
+        try:
+            response = requests.post(self.dbl_commands_url, json=commands, headers=headers)
+            response.raise_for_status()
+            logger.info(LogArea.API, f"Successfully synced {len(commands)} command(s) to discordbotlist.com")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(LogArea.API, f"Failed to sync commands to discordbotlist.com: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(LogArea.API, f"Response: {e.response.text}")
+            return False
+
+    def _flatten_commands(self, commands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Recursively flatten Discord's nested command tree into a flat list"""
+        flat = []
+        for cmd in commands:
+            options = cmd.get('options', [])
+            option_types = {o.get('type') for o in options}
+            if 1 not in option_types and 2 not in option_types:
+                flat.append(cmd)
+                continue
+            for option in options:
+                if option.get('type') == 2:  # SUB_COMMAND_GROUP
+                    for sub in option.get('options', []):
+                        flat.append({**sub, 'name': f"{cmd['name']} {option['name']} {sub['name']}"})
+                elif option.get('type') == 1:  # SUB_COMMAND
+                    flat.append({**option, 'name': f"{cmd['name']} {option['name']}"})
+        return flat
+
+    def sync_all_commands(self, commands: List[Dict[str, Any]]) -> Dict[str, bool]:
+        """
+        Sync slash commands to all configured platforms
+
+        Args:
+            commands: List of command objects from Discord
+
+        Returns:
+            dict: Results for each platform (platform_name: success_bool)
+        """
+        results = {}
+
+        flat_commands = self._flatten_commands(commands)
+        logger.info(LogArea.API, f"Syncing slash commands across all platforms...")
+
+        results['topgg'] = self.sync_commands_topgg(flat_commands)
+        results['dbl'] = self.sync_commands_dbl(flat_commands)
+
+        successful = sum(1 for success in results.values() if success)
+        total = len([k for k, v in results.items() if v is not None])
+        logger.info(LogArea.API, f"Commands sync complete: {successful}/{total} platforms synced successfully")
+
+        return results
+
 
 class BotStatsManager:
     """Manages multiple bots and their stats updates"""
@@ -265,6 +358,20 @@ class BotStatsManager:
             for platform, success in results.items():
                 status = "[OK]" if success else "[FAIL]"
                 logger.info(LogArea.API, f"  {status} {platform}")
+
+            # Resolve application_id (fallback to bot_id string if not set yet)
+            application_id = client.application_id or int(bot_config['bot_id'])
+
+            # Fetch registered global slash commands from Discord
+            logger.info(LogArea.API, f"Fetching slash commands for '{bot_config['name']}'...")
+            commands = await client.http.get_global_commands(application_id)
+            logger.info(LogArea.API, f"  - Commands found: {len(commands)}")
+
+            command_results = self.updaters[bot_id].sync_all_commands(commands)
+
+            for platform, success in command_results.items():
+                status = "[OK]" if success else "[FAIL]"
+                logger.info(LogArea.API, f"  {status} {platform} (commands)")
 
         except Exception as e:
             bot_name = bot_config.get('name', 'Unknown Bot')

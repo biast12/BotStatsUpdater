@@ -82,7 +82,7 @@ class BotLogger:
     def log(self, level: LogLevel, area: LogArea, message: str) -> None:
         if not self._console_enabled or not self._should_log(level):
             return
-        print(self._format_message(level, area, message))
+        print(self._format_message(level, area, message), flush=True)
 
     def debug(self, area: LogArea, message: str) -> None:
         self.log(LogLevel.DEBUG, area, message)
@@ -109,7 +109,7 @@ class BotLogger:
         width  = length if length is not None else 54
         line   = char * width
         c      = color if color is not None else _CYAN
-        print(f"{c}{line}{_RESET}")
+        print(f"{c}{line}{_RESET}", flush=True)
 
 
 logger = BotLogger.get_instance()

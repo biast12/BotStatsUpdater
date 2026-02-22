@@ -37,8 +37,8 @@ class BotStatsUpdater:
         self.dbl_token = dbl_token
 
         # API endpoints
-        self.topgg_url = f"https://top.gg/api/bots/{bot_id}/stats"
-        self.dbl_url = f"https://discordbotlist.com/api/v1/bots/{bot_id}/stats"
+        self.topgg_stats_url = f"https://top.gg/api/bots/{bot_id}/stats"
+        self.dbl_stats_url = f"https://discordbotlist.com/api/v1/bots/{bot_id}/stats"
 
     def update_topgg(self, server_count: int, shard_count: Optional[int] = None,
                      shard_id: Optional[int] = None) -> bool:
@@ -72,7 +72,7 @@ class BotStatsUpdater:
             payload["shard_id"] = shard_id
 
         try:
-            response = requests.post(self.topgg_url, json=payload, headers=headers)
+            response = requests.post(self.topgg_stats_url, json=payload, headers=headers)
             response.raise_for_status()
             logger.info(LogArea.API, f"Successfully updated top.gg stats: {server_count} servers")
             return True
@@ -118,7 +118,7 @@ class BotStatsUpdater:
             payload["shard_id"] = shard_id
 
         try:
-            response = requests.post(self.dbl_url, json=payload, headers=headers)
+            response = requests.post(self.dbl_stats_url, json=payload, headers=headers)
             response.raise_for_status()
             logger.info(LogArea.API, f"Successfully updated discordbotlist.com stats: {guilds} guilds")
             return True

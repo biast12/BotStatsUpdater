@@ -4,7 +4,9 @@
     {
       "bot_token": "",
       "topgg_token": "",
-      "dbl_token": ""
+      "dbl_token": "",
+      "server_count_channel_id": "",
+      "server_count_channel_format": "Servers: {count}"
     },
     {
       "bot_token": "",

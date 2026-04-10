@@ -10,6 +10,7 @@ import sys
 import json
 import asyncio
 import requests
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -279,6 +280,9 @@ class BotStatsManager:
         self.bots: List[discord.Client] = []
         self.updaters: Dict[str, BotStatsUpdater] = {}
         self.scheduler = AsyncIOScheduler()
+        # Tracks the last time each channel (by ID) had its name updated,
+        # used to enforce Discord's rate limit of 2 renames per 10 minutes.
+        self._channel_last_updated: Dict[int, datetime] = {}
 
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from JSON file"""
@@ -314,6 +318,76 @@ class BotStatsManager:
 
         return client
 
+    async def _update_server_count_channel(
+        self,
+        bot_config: Dict[str, Any],
+        client: discord.Client,
+        server_count: int
+    ):
+        """
+        Edit a Discord channel's name to reflect the current server count.
+
+        Config keys (both optional):
+          server_count_channel_id     — voice or text channel to rename
+          server_count_channel_format — format string; use {count} as placeholder.
+                                        If omitted, defaults to "<bot name>: <count>".
+                                        If provided without {count}, count is appended.
+
+        Enforces Discord's rate limit (2 renames / 10 min) by keeping a 5-minute
+        cooldown per channel. Updates are skipped (with a warning) when within cooldown.
+        """
+        channel_id_str = bot_config.get('server_count_channel_id', '')
+        if not channel_id_str:
+            return
+
+        try:
+            channel_id = int(channel_id_str)
+        except (ValueError, TypeError):
+            logger.warning(LogArea.CHANNEL, f"Invalid server_count_channel_id: {channel_id_str!r}")
+            return
+
+        # Discord allows 2 renames per 10 min; enforce a 5-min gap to stay safe.
+        COOLDOWN_SECONDS = 300
+        now = datetime.now(timezone.utc)
+        last_update = self._channel_last_updated.get(channel_id)
+        if last_update is not None:
+            elapsed = (now - last_update).total_seconds()
+            if elapsed < COOLDOWN_SECONDS:
+                remaining = int(COOLDOWN_SECONDS - elapsed)
+                bot_name = bot_config.get('name', 'Unknown Bot')
+                logger.warning(
+                    LogArea.CHANNEL,
+                    f"Skipping channel rename for '{bot_name}': "
+                    f"rate-limit cooldown ({remaining}s remaining)"
+                )
+                return
+
+        # Build the new channel name
+        bot_name = bot_config.get('name', client.user.name if client.user else 'Bot')
+        fmt = bot_config.get('server_count_channel_format', '')
+        if fmt:
+            if '{count}' in fmt:
+                channel_name = fmt.replace('{count}', str(server_count))
+            else:
+                channel_name = f"{fmt}{server_count}"
+        else:
+            channel_name = f"{bot_name}: {server_count}"
+
+        try:
+            channel = client.get_channel(channel_id)
+            if channel is None:
+                channel = await client.fetch_channel(channel_id)
+
+            await channel.edit(name=channel_name)
+            self._channel_last_updated[channel_id] = now
+            logger.info(LogArea.CHANNEL, f"Updated channel name to '{channel_name}' for '{bot_name}'")
+        except discord.Forbidden:
+            bot_name = bot_config.get('name', 'Unknown Bot')
+            logger.error(LogArea.CHANNEL, f"Missing 'Manage Channel' permission for channel {channel_id} ('{bot_name}')")
+        except discord.HTTPException as e:
+            bot_name = bot_config.get('name', 'Unknown Bot')
+            logger.error(LogArea.CHANNEL, f"Failed to rename channel {channel_id} for '{bot_name}': {e}")
+
     async def update_bot_stats(self, bot_config: Dict[str, Any], client: discord.Client):
         """Update stats for a specific bot"""
         try:
@@ -337,6 +411,9 @@ class BotStatsManager:
 
             logger.info(LogArea.API, f"Updating stats for '{bot_config['name']}':")
             logger.info(LogArea.API, f"  - Guilds: {guild_count}")
+
+            # Update server-count channel name (optional, config-driven)
+            await self._update_server_count_channel(bot_config, client, guild_count)
 
             # Get or create updater for this bot
             bot_id = bot_config['bot_id']

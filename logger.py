@@ -20,6 +20,7 @@ class LogArea(str, Enum):
     SHUTDOWN  = 'SHUTDOWN'
     API       = 'API'
     SCHEDULER = 'SCHEDULER'
+    CHANNEL   = 'CHANNEL'
     NONE      = 'NONE'
 
 

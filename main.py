@@ -38,20 +38,18 @@ class BotStatsUpdater:
         self.dbl_token = dbl_token
 
         # API endpoints
-        self.topgg_stats_url = f"https://top.gg/api/bots/{bot_id}/stats"
+        self.topgg_stats_url = "https://top.gg/api/v1/projects/@me/metrics"
         self.dbl_stats_url = f"https://discordbotlist.com/api/v1/bots/{bot_id}/stats"
         self.topgg_commands_url = "https://top.gg/api/v1/projects/@me/commands"
         self.dbl_commands_url   = f"https://discordbotlist.com/api/v1/bots/{bot_id}/commands"
 
-    def update_topgg(self, server_count: int, shard_count: Optional[int] = None,
-                     shard_id: Optional[int] = None) -> bool:
+    def update_topgg(self, server_count: int, shard_count: Optional[int] = None) -> bool:
         """
         Update stats on top.gg
 
         Args:
             server_count: Number of servers/guilds the bot is in
             shard_count: Total number of shards (optional)
-            shard_id: ID of the shard posting (optional, for sharded bots)
 
         Returns:
             bool: True if successful, False otherwise
@@ -61,7 +59,7 @@ class BotStatsUpdater:
             return False
 
         headers = {
-            "Authorization": self.topgg_token,
+            "Authorization": f"Bearer {self.topgg_token}",
             "Content-Type": "application/json"
         }
 
@@ -71,8 +69,6 @@ class BotStatsUpdater:
 
         if shard_count is not None:
             payload["shard_count"] = shard_count
-        if shard_id is not None:
-            payload["shard_id"] = shard_id
 
         try:
             response = requests.post(self.topgg_stats_url, json=payload, headers=headers)
@@ -155,8 +151,7 @@ class BotStatsUpdater:
         # Update top.gg
         results['topgg'] = self.update_topgg(
             server_count=server_count,
-            shard_count=shard_count,
-            shard_id=shard_id
+            shard_count=shard_count
         )
 
         # Update discordbotlist.com

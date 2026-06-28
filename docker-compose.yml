@@ -1,0 +1,7 @@
+services:
+  bot-stats-updater:
+    build: .
+    container_name: bot-stats-updater
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro

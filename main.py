@@ -26,6 +26,7 @@ logger = BotLogger.get_instance()
 
 REQUEST_TIMEOUT_SECONDS = 15
 GUILD_PAGE_SIZE = 200
+GUILD_PAGE_LIMIT = 500
 # Discord allows 2 renames per 10 min; a 5-min gap stays clear of it.
 CHANNEL_RENAME_COOLDOWN_SECONDS = 300
 
@@ -304,27 +305,41 @@ class BotStatsManager:
         """
         Page GET /users/@me/guilds, returning (guilds, summed approximate members).
 
-        Goes through the raw HTTP layer rather than Client.fetch_guilds() to avoid
-        building thousands of Guild objects per cycle. Raises on HTTP failure: a
-        partial count must never be posted.
+        Short pages are NOT the last page and the same request can return a
+        different count each time, so only an empty page ends the walk and IDs are
+        deduped. Raises on HTTP failure: a partial count must never be posted.
         """
         client = session.client
         after: Optional[int] = None
-        guilds = members = pages = 0
+        seen: set = set()
+        members = pages = 0
 
-        while True:
+        while pages < GUILD_PAGE_LIMIT:
             page = await client.http.get_guilds(GUILD_PAGE_SIZE, after=after, with_counts=True)
             pages += 1
-            guilds += len(page)
-            members += sum(int(g.get('approximate_member_count') or 0) for g in page)
-            if len(page) < GUILD_PAGE_SIZE:
+            if not page:
                 break
-            after = int(page[-1]['id'])
+
+            for guild in page:
+                guild_id = int(guild['id'])
+                if guild_id in seen:
+                    continue
+                seen.add(guild_id)
+                members += int(guild.get('approximate_member_count') or 0)
+
+            cursor = max(int(guild['id']) for guild in page)
+            if after is not None and cursor <= after:
+                break
+            after = cursor
+        else:
+            logger.warning(LogArea.API,
+                           f"[{session.label}] stopped at the {GUILD_PAGE_LIMIT}-page cap; "
+                           f"count may be short")
 
         logger.info(LogArea.API,
-                    f"[{session.label}] counted {guilds} guilds across {pages} page(s), "
+                    f"[{session.label}] counted {len(seen)} guilds across {pages} page(s), "
                     f"{members} members")
-        return guilds, members
+        return len(seen), members
 
     async def _resolve_shard_count(self, session: BotSession) -> int:
         """Configured value if set, else Discord's recommendation. Unsharded means one shard."""
@@ -333,7 +348,7 @@ class BotStatsManager:
             return configured
 
         try:
-            recommended, _url, limits = await session.client.http.get_bot_gateway()
+            recommended, _url, _limits = await session.client.http.get_bot_gateway()
         except Exception as e:
             logger.warning(LogArea.API,
                            f"[{session.label}] could not read /gateway/bot "
@@ -341,8 +356,7 @@ class BotStatsManager:
             return 1
 
         logger.info(LogArea.API,
-                    f"[{session.label}] Discord recommends {recommended} shard(s) "
-                    f"(session starts left: {limits.get('remaining')}/{limits.get('total')})")
+                    f"[{session.label}] Discord recommends {recommended} shard(s)")
         return max(1, int(recommended))
 
     async def _update_server_count_channel(self, session: BotSession, server_count: int):

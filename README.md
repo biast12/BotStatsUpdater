@@ -27,6 +27,7 @@ pip install -r requirements.txt
 | `bot_token` | Yes | Discord bot token |
 | `topgg_token` | No | Top.gg API token |
 | `dbl_token` | No | DiscordBotList.com API token |
+| `shard_count` | No | Number of shards this bot actually runs. Omit to report Discord's recommended count. |
 | `server_count_channel_id` | No | ID of a voice/text channel to rename with the server count |
 | `server_count_channel_format` | No | Custom format for the channel name (see below) |
 

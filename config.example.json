@@ -5,6 +5,7 @@
       "bot_token": "",
       "topgg_token": "",
       "dbl_token": "",
+      "shard_count": 6,
       "server_count_channel_id": "",
       "server_count_channel_format": "Servers: {count}"
     },

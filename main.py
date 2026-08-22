@@ -3,220 +3,171 @@
 Bot Statistics Updater
 Updates bot statistics on top.gg and discordbotlist.com
 Supports multiple bots with automatic data fetching and scheduled updates
+
+Counts are read over REST, never the gateway, so sharded and unsharded bots
+take the same code path.
 """
 
 import os
 import sys
 import json
 import asyncio
-import requests
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
+
+import aiohttp
+import discord
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-import discord
 
-from logger import BotLogger, LogLevel, LogArea
+from logger import BotLogger, LogArea
 logger = BotLogger.get_instance()
+
+REQUEST_TIMEOUT_SECONDS = 15
+GUILD_PAGE_SIZE = 200
+# Discord allows 2 renames per 10 min; a 5-min gap stays clear of it.
+CHANNEL_RENAME_COOLDOWN_SECONDS = 300
 
 
 class BotStatsUpdater:
     """Handles updating bot statistics across multiple bot list platforms"""
 
-    def __init__(self, bot_id: str, topgg_token: Optional[str] = None,
+    def __init__(self, bot_id: str, session: aiohttp.ClientSession, label: str,
+                 topgg_token: Optional[str] = None,
                  dbl_token: Optional[str] = None):
-        """
-        Initialize the stats updater
-
-        Args:
-            bot_id: Your Discord bot's client ID
-            topgg_token: Top.gg API token
-            dbl_token: DiscordBotList.com API token
-        """
         self.bot_id = bot_id
+        self.session = session
+        self.label = label
         self.topgg_token = topgg_token
         self.dbl_token = dbl_token
 
-        # API endpoints
         self.topgg_stats_url = "https://top.gg/api/v1/projects/@me/metrics"
-        self.dbl_stats_url = f"https://discordbotlist.com/api/v1/bots/{bot_id}/stats"
         self.topgg_commands_url = "https://top.gg/api/v1/projects/@me/commands"
-        self.dbl_commands_url   = f"https://discordbotlist.com/api/v1/bots/{bot_id}/commands"
+        self.dbl_stats_url = f"https://discordbotlist.com/api/v1/bots/{bot_id}/stats"
+        self.dbl_commands_url = f"https://discordbotlist.com/api/v1/bots/{bot_id}/commands"
 
-    def update_topgg(self, server_count: int, shard_count: Optional[int] = None) -> bool:
-        """
-        Update stats on top.gg
+    async def _send(self, method: str, url: str, *, auth: str,
+                    payload: Any, what: str) -> bool:
+        """Single funnel for every outbound call. Retries once on 429/5xx/network."""
+        headers = {"Authorization": auth, "Content-Type": "application/json"}
 
-        Args:
-            server_count: Number of servers/guilds the bot is in
-            shard_count: Total number of shards (optional)
+        for attempt in (1, 2):
+            try:
+                async with self.session.request(method, url, json=payload, headers=headers) as response:
+                    if response.status in (200, 201, 204):
+                        return True
 
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        if not self.topgg_token:
-            logger.warning(LogArea.API, "Top.gg token not provided, skipping top.gg update")
-            return False
+                    body = (await response.text())[:400]
+                    logger.error(LogArea.API,
+                                 f"[{self.label}] {what} failed: HTTP {response.status} {body}")
 
-        headers = {
-            "Authorization": f"Bearer {self.topgg_token}",
-            "Content-Type": "application/json"
-        }
+                    if response.status in (401, 403):
+                        logger.critical(LogArea.API,
+                                        f"[{self.label}] {what}: token rejected, fix it in config.json")
+                        return False
+                    if response.status != 429 and response.status < 500:
+                        return False
+                    if attempt == 2:
+                        return False
+                    await asyncio.sleep(self._retry_after(response))
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.error(LogArea.API,
+                             f"[{self.label}] {what} failed: {type(e).__name__}: {e} (attempt {attempt})")
+                if attempt == 2:
+                    return False
+                await asyncio.sleep(2)
 
-        payload: Dict[str, Any] = {
-            "server_count": server_count
-        }
+        return False
 
-        if shard_count is not None:
-            payload["shard_count"] = shard_count
-
+    @staticmethod
+    def _retry_after(response: aiohttp.ClientResponse) -> float:
         try:
-            response = requests.post(self.topgg_stats_url, json=payload, headers=headers)
-            response.raise_for_status()
-            logger.info(LogArea.API, f"Successfully updated top.gg stats: {server_count} servers")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(LogArea.API, f"Failed to update top.gg stats: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(LogArea.API, f"Response: {e.response.text}")
-            return False
+            return min(float(response.headers.get("Retry-After", 2)), 10.0)
+        except (TypeError, ValueError):
+            return 2.0
 
-    def update_dbl(self, guilds: int, users: Optional[int] = None,
-                   voice_connections: Optional[int] = None,
-                   shard_id: Optional[int] = None) -> bool:
-        """
-        Update stats on discordbotlist.com
+    def _log_tally(self, what: str, results: Dict[str, Optional[bool]]) -> None:
+        configured = [outcome for outcome in results.values() if outcome is not None]
+        successful = sum(1 for outcome in configured if outcome)
+        logger.info(LogArea.API,
+                    f"[{self.label}] {what}: {successful}/{len(configured)} platform(s) succeeded")
 
-        Args:
-            guilds: Number of guilds the bot is in
-            users: Total user count (optional)
-            voice_connections: Active voice connections (optional)
-            shard_id: Shard identifier for per-shard stats (optional)
+    async def update_topgg(self, server_count: int, shard_count: int) -> Optional[bool]:
+        """Returns True sent, False failed, None when no token is configured."""
+        if not self.topgg_token:
+            logger.warning(LogArea.API, f"[{self.label}] no top.gg token, skipping top.gg update")
+            return None
 
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        if not self.dbl_token:
-            logger.warning(LogArea.API, "DiscordBotList token not provided, skipping DBL update")
-            return False
-
-        headers = {
-            "Authorization": self.dbl_token,
-            "Content-Type": "application/json"
-        }
-
+        # This route is a PATCH, so an omitted field keeps its old value; always
+        # send shard_count rather than letting a stale one stand.
         payload: Dict[str, Any] = {
-            "guilds": guilds
+            "server_count": server_count,
+            "shard_count": shard_count,
         }
 
+        ok = await self._send("PATCH", self.topgg_stats_url,
+                              auth=f"Bearer {self.topgg_token}",
+                              payload=payload, what="top.gg metrics")
+        if ok:
+            logger.info(LogArea.API,
+                        f"[{self.label}] top.gg updated: {server_count} servers, {shard_count} shard(s)")
+        return ok
+
+    async def update_dbl(self, guilds: int, users: Optional[int] = None) -> Optional[bool]:
+        """Returns True sent, False failed, None when no token is configured."""
+        if not self.dbl_token:
+            logger.warning(LogArea.API, f"[{self.label}] no DiscordBotList token, skipping DBL update")
+            return None
+
+        payload: Dict[str, Any] = {"guilds": guilds}
         if users is not None:
             payload["users"] = users
-        if voice_connections is not None:
-            payload["voice_connections"] = voice_connections
-        if shard_id is not None:
-            payload["shard_id"] = shard_id
 
-        try:
-            response = requests.post(self.dbl_stats_url, json=payload, headers=headers)
-            response.raise_for_status()
-            logger.info(LogArea.API, f"Successfully updated discordbotlist.com stats: {guilds} guilds")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(LogArea.API, f"Failed to update discordbotlist.com stats: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(LogArea.API, f"Response: {e.response.text}")
-            return False
+        ok = await self._send("POST", self.dbl_stats_url,
+                              auth=self.dbl_token,
+                              payload=payload, what="discordbotlist.com stats")
+        if ok:
+            logger.info(LogArea.API, f"[{self.label}] discordbotlist.com updated: {guilds} guilds")
+        return ok
 
-    def update_all(self, server_count: int, users: Optional[int] = None,
-                   voice_connections: Optional[int] = None,
-                   shard_count: Optional[int] = None,
-                   shard_id: Optional[int] = None) -> Dict[str, bool]:
-        """
-        Update stats on all configured platforms
+    async def update_all(self, server_count: int, shard_count: int,
+                         users: Optional[int] = None) -> Dict[str, Optional[bool]]:
+        logger.info(LogArea.API, f"[{self.label}] updating stats across all platforms...")
 
-        Args:
-            server_count: Number of servers/guilds the bot is in
-            users: Total user count (optional)
-            voice_connections: Active voice connections (optional)
-            shard_count: Total number of shards (optional)
-            shard_id: Shard identifier (optional)
-
-        Returns:
-            dict: Results for each platform (platform_name: success_bool)
-        """
-        results = {}
-
-        logger.info(LogArea.API, f"Updating bot stats across all platforms...")
-
-        # Update top.gg
-        results['topgg'] = self.update_topgg(
-            server_count=server_count,
-            shard_count=shard_count
+        topgg, dbl = await asyncio.gather(
+            self.update_topgg(server_count=server_count, shard_count=shard_count),
+            self.update_dbl(guilds=server_count, users=users),
         )
 
-        # Update discordbotlist.com
-        results['dbl'] = self.update_dbl(
-            guilds=server_count,
-            users=users,
-            voice_connections=voice_connections,
-            shard_id=shard_id
-        )
-
-        successful = sum(1 for success in results.values() if success)
-        total = len([k for k, v in results.items() if v is not None])
-        logger.info(LogArea.API, f"Stats update complete: {successful}/{total} platforms updated successfully")
-
+        results: Dict[str, Optional[bool]] = {"topgg": topgg, "dbl": dbl}
+        self._log_tally("stats update", results)
         return results
 
-    def sync_commands_topgg(self, commands: List[Dict[str, Any]]) -> bool:
-        """
-        Sync slash commands to top.gg
-
-        Args:
-            commands: List of command objects from Discord
-
-        Returns:
-            bool: True if successful, False otherwise
-        """
+    async def sync_commands_topgg(self, commands: List[Dict[str, Any]]) -> Optional[bool]:
         if not self.topgg_token:
-            logger.warning(LogArea.API, "Top.gg token not provided, skipping top.gg commands sync")
-            return False
-        headers = {"Authorization": f"Bearer {self.topgg_token}", "Content-Type": "application/json"}
-        try:
-            response = requests.post(self.topgg_commands_url, json=commands, headers=headers)
-            response.raise_for_status()
-            logger.info(LogArea.API, f"Successfully synced {len(commands)} command(s) to top.gg")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(LogArea.API, f"Failed to sync commands to top.gg: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(LogArea.API, f"Response: {e.response.text}")
-            return False
+            logger.warning(LogArea.API, f"[{self.label}] no top.gg token, skipping top.gg commands sync")
+            return None
 
-    def sync_commands_dbl(self, commands: List[Dict[str, Any]]) -> bool:
-        """
-        Sync slash commands to discordbotlist.com
+        ok = await self._send("PUT", self.topgg_commands_url,
+                              auth=f"Bearer {self.topgg_token}",
+                              payload=commands, what="top.gg commands sync")
+        if ok:
+            logger.info(LogArea.API, f"[{self.label}] synced {len(commands)} command(s) to top.gg")
+        return ok
 
-        Args:
-            commands: List of command objects from Discord
-
-        Returns:
-            bool: True if successful, False otherwise
-        """
+    async def sync_commands_dbl(self, commands: List[Dict[str, Any]]) -> Optional[bool]:
         if not self.dbl_token:
-            logger.warning(LogArea.API, "DiscordBotList token not provided, skipping DBL commands sync")
-            return False
-        headers = {"Authorization": self.dbl_token, "Content-Type": "application/json"}
-        try:
-            response = requests.post(self.dbl_commands_url, json=commands, headers=headers)
-            response.raise_for_status()
-            logger.info(LogArea.API, f"Successfully synced {len(commands)} command(s) to discordbotlist.com")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(LogArea.API, f"Failed to sync commands to discordbotlist.com: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(LogArea.API, f"Response: {e.response.text}")
-            return False
+            logger.warning(LogArea.API, f"[{self.label}] no DiscordBotList token, skipping DBL commands sync")
+            return None
+
+        ok = await self._send("POST", self.dbl_commands_url,
+                              auth=self.dbl_token,
+                              payload=commands, what="discordbotlist.com commands sync")
+        if ok:
+            logger.info(LogArea.API,
+                        f"[{self.label}] synced {len(commands)} command(s) to discordbotlist.com")
+        return ok
 
     def _flatten_commands(self, commands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Recursively flatten Discord's nested command tree into a flat list"""
@@ -235,56 +186,112 @@ class BotStatsUpdater:
                     flat.append({**option, 'name': f"{cmd['name']} {option['name']}"})
         return flat
 
-    def sync_all_commands(self, commands: List[Dict[str, Any]]) -> Dict[str, bool]:
-        """
-        Sync slash commands to all configured platforms
-
-        Args:
-            commands: List of command objects from Discord
-
-        Returns:
-            dict: Results for each platform (platform_name: success_bool)
-        """
-        results = {}
-
+    async def sync_all_commands(self, commands: List[Dict[str, Any]]) -> Dict[str, Optional[bool]]:
         flat_commands = self._flatten_commands(commands)
-        logger.info(LogArea.API, f"Syncing slash commands across all platforms...")
+        logger.info(LogArea.API, f"[{self.label}] syncing slash commands across all platforms...")
 
-        results['topgg'] = self.sync_commands_topgg(flat_commands)
-        results['dbl'] = self.sync_commands_dbl(flat_commands)
+        topgg, dbl = await asyncio.gather(
+            self.sync_commands_topgg(flat_commands),
+            self.sync_commands_dbl(flat_commands),
+        )
 
-        successful = sum(1 for success in results.values() if success)
-        total = len([k for k, v in results.items() if v is not None])
-        logger.info(LogArea.API, f"Commands sync complete: {successful}/{total} platforms synced successfully")
-
+        results: Dict[str, Optional[bool]] = {"topgg": topgg, "dbl": dbl}
+        self._log_tally("commands sync", results)
         return results
+
+
+@dataclass
+class BotSession:
+    """One bot's config, REST-only client and poster, bound together so they cannot drift apart."""
+    index: int
+    config: Dict[str, Any]
+    client: Optional[discord.Client] = None
+    updater: Optional[BotStatsUpdater] = None
+    bot_id: Optional[str] = None
+    application_id: Optional[int] = None
+    name: str = ""
+    dead_reason: Optional[str] = None
+
+    @property
+    def label(self) -> str:
+        return self.name or self.config.get('name') or f"bot#{self.index + 1}"
+
+    async def ensure_login(self, session: aiohttp.ClientSession) -> bool:
+        """Guarantee a logged-in client. Never raises; logs every failure."""
+        if self.dead_reason:
+            return False
+        if self.client is not None:
+            return True
+
+        token = (self.config.get('bot_token') or '').strip()
+        if not token:
+            self.dead_reason = "no bot_token configured"
+            logger.critical(LogArea.CONFIG, f"[{self.label}] no bot_token configured, bot disabled")
+            return False
+
+        # Intents only reach Discord in a gateway IDENTIFY, which never happens here.
+        client = discord.Client(intents=discord.Intents.none())
+        try:
+            # HTTP only, no websocket, so the mandatory-sharding rule (close code
+            # 4011) cannot apply.
+            await client.login(token)
+        except discord.LoginFailure as e:
+            # static_login opens the aiohttp session before the request that 401s.
+            await client.close()
+            self.dead_reason = f"invalid bot_token ({e})"
+            logger.critical(LogArea.BOT,
+                            f"[{self.label}] login rejected: {e} -- fix bot_token in config.json")
+            return False
+        except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            await client.close()
+            logger.error(LogArea.BOT,
+                         f"[{self.label}] login failed ({type(e).__name__}: {e}), retrying next cycle")
+            return False
+
+        self.client = client
+        self.bot_id = str(client.user.id)
+        self.application_id = client.application_id or client.user.id
+        self.name = self.config.get('name') or client.user.name
+        self.config['name'] = self.name
+        self.config['bot_id'] = self.bot_id
+        self.updater = BotStatsUpdater(
+            bot_id=self.bot_id,
+            session=session,
+            label=self.label,
+            topgg_token=self.config.get('topgg_token'),
+            dbl_token=self.config.get('dbl_token'),
+        )
+
+        logger.info(LogArea.BOT,
+                    f"[{self.label}] logged in (REST-only): bot_id={self.bot_id} "
+                    f"app_id={self.application_id}")
+        return True
+
+    async def close(self) -> None:
+        if self.client is not None:
+            # close() drops the loop reference, so this client can never log in
+            # again; a retry builds a fresh one.
+            await self.client.close()
+            self.client = None
 
 
 class BotStatsManager:
     """Manages multiple bots and their stats updates"""
 
     def __init__(self, config_path: str = "config.json"):
-        """
-        Initialize the bot stats manager
-
-        Args:
-            config_path: Path to the configuration file
-        """
         self.config_path = config_path
         self.config = self._load_config()
-        self.bots: List[discord.Client] = []
-        self.updaters: Dict[str, BotStatsUpdater] = {}
+        self.sessions: List[BotSession] = []
+        self.http: Optional[aiohttp.ClientSession] = None
         self.scheduler = AsyncIOScheduler()
-        # Tracks the last time each channel (by ID) had its name updated,
-        # used to enforce Discord's rate limit of 2 renames per 10 minutes.
         self._channel_last_updated: Dict[int, datetime] = {}
 
     def _load_config(self) -> Dict[str, Any]:
-        """Load configuration from JSON file"""
         try:
             with open(self.config_path, 'r') as f:
                 config = json.load(f)
-                logger.info(LogArea.CONFIG, f"Loaded configuration for {len(config.get('bots', []))} bot(s)")
+                logger.info(LogArea.CONFIG,
+                            f"Loaded configuration for {len(config.get('bots', []))} bot(s)")
                 return config
         except FileNotFoundError:
             logger.error(LogArea.CONFIG, f"Configuration file not found: {self.config_path}")
@@ -293,44 +300,61 @@ class BotStatsManager:
             logger.error(LogArea.CONFIG, f"Invalid JSON in configuration file: {e}")
             sys.exit(1)
 
-    async def _create_bot_client(self, bot_config: Dict[str, Any]) -> discord.Client:
-        """Create a Discord client for a bot"""
-        intents = discord.Intents.default()
-        intents.guilds = True
-
-        client = discord.Client(intents=intents)
-
-        @client.event
-        async def on_ready():
-            # Auto-populate bot_id and name from the client
-            bot_config['bot_id'] = str(client.user.id)
-            if 'name' not in bot_config or not bot_config['name']:
-                bot_config['name'] = client.user.name
-
-            logger.info(LogArea.BOT, f"Bot '{bot_config['name']}' ({client.user}) is ready!")
-            logger.info(LogArea.BOT, f"  - Bot ID: {bot_config['bot_id']}")
-            logger.info(LogArea.BOT, f"  - Guilds: {len(client.guilds)}")
-
-        return client
-
-    async def _update_server_count_channel(
-        self,
-        bot_config: Dict[str, Any],
-        client: discord.Client,
-        server_count: int
-    ):
+    async def _count_guilds(self, session: BotSession) -> Tuple[int, int]:
         """
-        Edit a Discord channel's name to reflect the current server count.
+        Page GET /users/@me/guilds, returning (guilds, summed approximate members).
 
-        Config keys (both optional):
-          server_count_channel_id     — voice or text channel to rename
-          server_count_channel_format — format string; use {count} as placeholder.
-                                        If omitted, defaults to "<bot name>: <count>".
-                                        If provided without {count}, count is appended.
-
-        Enforces Discord's rate limit (2 renames / 10 min) by keeping a 5-minute
-        cooldown per channel. Updates are skipped (with a warning) when within cooldown.
+        Goes through the raw HTTP layer rather than Client.fetch_guilds() to avoid
+        building thousands of Guild objects per cycle. Raises on HTTP failure: a
+        partial count must never be posted.
         """
+        client = session.client
+        after: Optional[int] = None
+        guilds = members = pages = 0
+
+        while True:
+            page = await client.http.get_guilds(GUILD_PAGE_SIZE, after=after, with_counts=True)
+            pages += 1
+            guilds += len(page)
+            members += sum(int(g.get('approximate_member_count') or 0) for g in page)
+            if len(page) < GUILD_PAGE_SIZE:
+                break
+            after = int(page[-1]['id'])
+
+        logger.info(LogArea.API,
+                    f"[{session.label}] counted {guilds} guilds across {pages} page(s), "
+                    f"{members} members")
+        return guilds, members
+
+    async def _resolve_shard_count(self, session: BotSession) -> int:
+        """Configured value if set, else Discord's recommendation. Unsharded means one shard."""
+        configured = session.config.get('shard_count')
+        if isinstance(configured, int) and not isinstance(configured, bool) and configured >= 1:
+            return configured
+
+        try:
+            recommended, _url, limits = await session.client.http.get_bot_gateway()
+        except Exception as e:
+            logger.warning(LogArea.API,
+                           f"[{session.label}] could not read /gateway/bot "
+                           f"({type(e).__name__}: {e}), reporting shard_count=1")
+            return 1
+
+        logger.info(LogArea.API,
+                    f"[{session.label}] Discord recommends {recommended} shard(s) "
+                    f"(session starts left: {limits.get('remaining')}/{limits.get('total')})")
+        return max(1, int(recommended))
+
+    async def _update_server_count_channel(self, session: BotSession, server_count: int):
+        """
+        Rename a channel to reflect the current server count.
+
+        server_count_channel_id     - voice or text channel to rename
+        server_count_channel_format - uses {count} as placeholder; defaults to
+                                      "<bot name>: <count>". Without {count} the
+                                      count is appended.
+        """
+        bot_config = session.config
         channel_id_str = bot_config.get('server_count_channel_id', '')
         if not channel_id_str:
             return
@@ -338,27 +362,21 @@ class BotStatsManager:
         try:
             channel_id = int(channel_id_str)
         except (ValueError, TypeError):
-            logger.warning(LogArea.CHANNEL, f"Invalid server_count_channel_id: {channel_id_str!r}")
+            logger.warning(LogArea.CHANNEL,
+                           f"[{session.label}] invalid server_count_channel_id: {channel_id_str!r}")
             return
 
-        # Discord allows 2 renames per 10 min; enforce a 5-min gap to stay safe.
-        COOLDOWN_SECONDS = 300
         now = datetime.now(timezone.utc)
         last_update = self._channel_last_updated.get(channel_id)
         if last_update is not None:
             elapsed = (now - last_update).total_seconds()
-            if elapsed < COOLDOWN_SECONDS:
-                remaining = int(COOLDOWN_SECONDS - elapsed)
-                bot_name = bot_config.get('name', 'Unknown Bot')
-                logger.warning(
-                    LogArea.CHANNEL,
-                    f"Skipping channel rename for '{bot_name}': "
-                    f"rate-limit cooldown ({remaining}s remaining)"
-                )
+            if elapsed < CHANNEL_RENAME_COOLDOWN_SECONDS:
+                remaining = int(CHANNEL_RENAME_COOLDOWN_SECONDS - elapsed)
+                logger.warning(LogArea.CHANNEL,
+                               f"[{session.label}] skipping channel rename: "
+                               f"rate-limit cooldown ({remaining}s remaining)")
                 return
 
-        # Build the new channel name
-        bot_name = bot_config.get('name', client.user.name if client.user else 'Bot')
         fmt = bot_config.get('server_count_channel_format', '')
         if fmt:
             if '{count}' in fmt:
@@ -366,88 +384,69 @@ class BotStatsManager:
             else:
                 channel_name = f"{fmt}{server_count}"
         else:
-            channel_name = f"{bot_name}: {server_count}"
+            channel_name = f"{session.label}: {server_count}"
 
         try:
-            channel = client.get_channel(channel_id)
-            if channel is None:
-                channel = await client.fetch_channel(channel_id)
-
+            # No gateway means no channel cache, so always fetch.
+            channel = await session.client.fetch_channel(channel_id)
             await channel.edit(name=channel_name)
-            self._channel_last_updated[channel_id] = now
-            logger.info(LogArea.CHANNEL, f"Updated channel name to '{channel_name}' for '{bot_name}'")
         except discord.Forbidden:
-            bot_name = bot_config.get('name', 'Unknown Bot')
-            logger.error(LogArea.CHANNEL, f"Missing 'Manage Channel' permission for channel {channel_id} ('{bot_name}')")
-        except discord.HTTPException as e:
-            bot_name = bot_config.get('name', 'Unknown Bot')
-            logger.error(LogArea.CHANNEL, f"Failed to rename channel {channel_id} for '{bot_name}': {e}")
+            logger.error(LogArea.CHANNEL,
+                         f"[{session.label}] missing 'Manage Channel' permission "
+                         f"for channel {channel_id}")
+        except (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(LogArea.CHANNEL,
+                         f"[{session.label}] failed to rename channel {channel_id}: "
+                         f"{type(e).__name__}: {e}")
+        else:
+            self._channel_last_updated[channel_id] = now
+            logger.info(LogArea.CHANNEL,
+                        f"[{session.label}] updated channel name to '{channel_name}'")
 
-    async def update_bot_stats(self, bot_config: Dict[str, Any], client: discord.Client):
-        """Update stats for a specific bot"""
+    @staticmethod
+    def _log_results(session: BotSession, results: Dict[str, Optional[bool]],
+                     suffix: str = "") -> None:
+        for platform, outcome in results.items():
+            status = "[SKIP]" if outcome is None else ("[OK]" if outcome else "[FAIL]")
+            logger.info(LogArea.API, f"[{session.label}]   {status} {platform}{suffix}")
+
+    async def update_bot_stats(self, session: BotSession):
+        """Run one full update cycle for a single bot"""
+        if not await session.ensure_login(self.http):
+            return
+
+        client = session.client
+
         try:
-            if not client.is_ready():
-                bot_name = bot_config.get('name', 'Unknown Bot')
-                logger.warning(LogArea.BOT, f"Bot '{bot_name}' is not ready, skipping stats update")
-                return
+            guild_count, member_count = await self._count_guilds(session)
+        except (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(LogArea.API,
+                         f"[{session.label}] guild count failed ({type(e).__name__}: {e}); "
+                         f"skipping this cycle rather than posting a partial count")
+            return
 
-            # Auto-populate bot_id from client if not set
-            if 'bot_id' not in bot_config:
-                bot_config['bot_id'] = str(client.user.id)
+        shard_count = await self._resolve_shard_count(session)
 
-            # Auto-populate name from client if not set
-            if 'name' not in bot_config or not bot_config['name']:
-                bot_config['name'] = client.user.name
+        await self._update_server_count_channel(session, guild_count)
 
-            # Gather statistics
-            guild_count = len(client.guilds)
-            user_count = 0  # Not tracking users
-            voice_connections = 0  # Not tracking voice connections
+        results = await session.updater.update_all(
+            server_count=guild_count,
+            shard_count=shard_count,
+            users=member_count,
+        )
+        self._log_results(session, results)
 
-            logger.info(LogArea.API, f"Updating stats for '{bot_config['name']}':")
-            logger.info(LogArea.API, f"  - Guilds: {guild_count}")
+        try:
+            commands = await client.http.get_global_commands(session.application_id)
+        except (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.error(LogArea.API,
+                         f"[{session.label}] fetching slash commands failed "
+                         f"({type(e).__name__}: {e})")
+            return
 
-            # Update server-count channel name (optional, config-driven)
-            await self._update_server_count_channel(bot_config, client, guild_count)
-
-            # Get or create updater for this bot
-            bot_id = bot_config['bot_id']
-            if bot_id not in self.updaters:
-                self.updaters[bot_id] = BotStatsUpdater(
-                    bot_id=bot_id,
-                    topgg_token=bot_config.get('topgg_token'),
-                    dbl_token=bot_config.get('dbl_token')
-                )
-
-            # Update stats on all platforms
-            results = self.updaters[bot_id].update_all(
-                server_count=guild_count,
-                users=user_count,
-                voice_connections=voice_connections
-            )
-
-            # Log results
-            for platform, success in results.items():
-                status = "[OK]" if success else "[FAIL]"
-                logger.info(LogArea.API, f"  {status} {platform}")
-
-            # Resolve application_id (fallback to bot_id string if not set yet)
-            application_id = client.application_id or int(bot_config['bot_id'])
-
-            # Fetch registered global slash commands from Discord
-            logger.info(LogArea.API, f"Fetching slash commands for '{bot_config['name']}'...")
-            commands = await client.http.get_global_commands(application_id)
-            logger.info(LogArea.API, f"  - Commands found: {len(commands)}")
-
-            command_results = self.updaters[bot_id].sync_all_commands(commands)
-
-            for platform, success in command_results.items():
-                status = "[OK]" if success else "[FAIL]"
-                logger.info(LogArea.API, f"  {status} {platform} (commands)")
-
-        except Exception as e:
-            bot_name = bot_config.get('name', 'Unknown Bot')
-            logger.error(LogArea.API, f"Error updating stats for '{bot_name}': {e}")
+        logger.info(LogArea.API, f"[{session.label}] {len(commands)} global command(s) found")
+        command_results = await session.updater.sync_all_commands(commands)
+        self._log_results(session, command_results, suffix=" (commands)")
 
     async def update_all_bots_stats(self):
         """Update stats for all configured bots"""
@@ -455,81 +454,90 @@ class BotStatsManager:
         logger.info(LogArea.SCHEDULER, "Starting scheduled stats update")
         logger.spacer()
 
-        tasks = []
-        for i, bot_config in enumerate(self.config['bots']):
-            if i < len(self.bots):
-                tasks.append(self.update_bot_stats(bot_config, self.bots[i]))
-
-        await asyncio.gather(*tasks)
+        outcomes = await asyncio.gather(
+            *(self.update_bot_stats(session) for session in self.sessions),
+            return_exceptions=True,
+        )
+        for session, outcome in zip(self.sessions, outcomes):
+            if isinstance(outcome, BaseException):
+                logger.critical(LogArea.SCHEDULER,
+                                f"[{session.label}] update cycle crashed: "
+                                f"{type(outcome).__name__}: {outcome}")
 
         logger.spacer()
         logger.info(LogArea.SCHEDULER, "Stats update completed")
         logger.spacer()
 
     async def start(self):
-        """Start all bots and the scheduler"""
-        logger.info(LogArea.STARTUP, "Starting Bot Stats Manager...")
+        """Log in all bots and start the scheduler"""
+        logger.info(LogArea.STARTUP, "Starting Bot Stats Manager (REST-only, no gateway)...")
 
-        # Create and login all bots
-        for bot_config in self.config['bots']:
-            try:
-                client = await self._create_bot_client(bot_config)
-                self.bots.append(client)
+        self.http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=5),
+        )
 
-                # Login bot in background
-                asyncio.create_task(client.start(bot_config['bot_token']))
+        self.sessions = [BotSession(index=i, config=bot_config)
+                         for i, bot_config in enumerate(self.config.get('bots', []))]
+        if not self.sessions:
+            logger.critical(LogArea.CONFIG, "No bots configured, nothing to do")
+            return
 
-                # Wait a bit for the bot to connect
-                await asyncio.sleep(2)
+        logins = await asyncio.gather(
+            *(session.ensure_login(self.http) for session in self.sessions),
+            return_exceptions=True,
+        )
+        for session, outcome in zip(self.sessions, logins):
+            if isinstance(outcome, BaseException):
+                logger.critical(LogArea.STARTUP,
+                                f"[{session.label}] login raised "
+                                f"{type(outcome).__name__}: {outcome}")
 
-            except Exception as e:
-                logger.error(LogArea.STARTUP, f"Failed to start bot '{bot_config['name']}': {e}")
+        ready = sum(1 for outcome in logins if outcome is True)
+        logger.info(LogArea.STARTUP, f"Logged in {ready}/{len(self.sessions)} bot(s)")
+        if not ready:
+            logger.critical(LogArea.STARTUP,
+                            "No bot logged in; check tokens and network. Login is retried each cycle.")
 
-        # Wait for all bots to be ready
-        logger.info(LogArea.STARTUP, "Waiting for all bots to be ready...")
-        max_wait = 30  # seconds
-        waited = 0
-        while not all(bot.is_ready() for bot in self.bots) and waited < max_wait:
-            await asyncio.sleep(1)
-            waited += 1
-
-        if not all(bot.is_ready() for bot in self.bots):
-            logger.warning(LogArea.STARTUP, "Not all bots are ready, but continuing anyway...")
-
-        # Do initial stats update
         logger.info(LogArea.STARTUP, "Performing initial stats update...")
         await self.update_all_bots_stats()
 
-        # Schedule periodic updates
         interval_minutes = self.config.get('update_interval_minutes', 30)
         self.scheduler.add_job(
             self.update_all_bots_stats,
             IntervalTrigger(minutes=interval_minutes),
             id='stats_update',
             name='Update bot statistics',
-            replace_existing=True
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
         )
 
         self.scheduler.start()
         logger.info(LogArea.SCHEDULER, f"Scheduled stats updates every {interval_minutes} minutes")
         logger.info(LogArea.STARTUP, "Bot Stats Manager is now running. Press Ctrl+C to stop.")
 
-        # Keep running
-        try:
-            while True:
-                await asyncio.sleep(3600)  # Sleep for 1 hour
-        except KeyboardInterrupt:
-            logger.info(LogArea.SHUTDOWN, "Shutting down...")
-            await self.stop()
+        await asyncio.Event().wait()
 
     async def stop(self):
-        """Stop all bots and the scheduler"""
+        """Stop the scheduler and release every client"""
         logger.info(LogArea.SHUTDOWN, "Stopping scheduler...")
-        self.scheduler.shutdown()
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
 
         logger.info(LogArea.SHUTDOWN, "Closing all bot connections...")
-        for bot in self.bots:
-            await bot.close()
+        for session in self.sessions:
+            try:
+                await session.close()
+            except Exception as e:
+                logger.warning(LogArea.SHUTDOWN,
+                               f"[{session.label}] close failed: {type(e).__name__}: {e}")
+
+        if self.http is not None and not self.http.closed:
+            await self.http.close()
+
+        # aiohttp closes TLS transports asynchronously; yield so they finish before
+        # the loop shuts down, rather than surfacing as unclosed-socket warnings.
+        await asyncio.sleep(0.25)
 
         logger.info(LogArea.SHUTDOWN, "Bot Stats Manager stopped.")
 
@@ -544,12 +552,14 @@ async def main():
         sys.exit(1)
 
     manager = BotStatsManager(config_file)
-    await manager.start()
+    try:
+        await manager.start()
+    finally:
+        await manager.stop()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info(LogArea.SHUTDOWN, "Received interrupt signal, shutting down...")
-        sys.exit(0)

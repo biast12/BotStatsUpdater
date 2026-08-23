@@ -10,3 +10,4 @@ ENV/
 .idea/
 README.md
 config.example.json
+heartbeat

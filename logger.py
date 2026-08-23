@@ -1,7 +1,7 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 
 class LogLevel(str, Enum):
@@ -33,6 +33,8 @@ _LEVEL_ORDER = [
     LogLevel.NONE,
 ]
 
+_SINK_LEVELS = frozenset({LogLevel.ERROR, LogLevel.CRITICAL})
+
 _COLORS = {
     LogLevel.DEBUG:    '\x1b[90m',
     LogLevel.INFO:     '\x1b[92m',
@@ -51,6 +53,7 @@ class BotLogger:
     def __init__(self) -> None:
         self._console_enabled: bool = True
         self._min_level: LogLevel = LogLevel.INFO
+        self._sink: Optional[Callable[[LogLevel, LogArea, str], None]] = None
 
     @classmethod
     def get_instance(cls) -> BotLogger:
@@ -80,10 +83,19 @@ class BotLogger:
             f"{color}[{now}] [{padded_level}] [{padded_area}] {message}{_RESET}"
         )
 
+    def set_sink(self, sink: Optional[Callable[[LogLevel, LogArea, str], None]]) -> None:
+        """Also hand ERROR and CRITICAL messages to `sink`."""
+        self._sink = sink
+
     def log(self, level: LogLevel, area: LogArea, message: str) -> None:
-        if not self._console_enabled or not self._should_log(level):
-            return
-        print(self._format_message(level, area, message), flush=True)
+        if self._console_enabled and self._should_log(level):
+            print(self._format_message(level, area, message), flush=True)
+
+        if self._sink is not None and level in _SINK_LEVELS:
+            try:
+                self._sink(level, area, message)
+            except Exception:
+                pass
 
     def debug(self, area: LogArea, message: str) -> None:
         self.log(LogLevel.DEBUG, area, message)

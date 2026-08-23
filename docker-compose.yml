@@ -5,3 +5,10 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.json:/app/config.json:ro
+    healthcheck:
+      # The app stamps /app/heartbeat with the deadline the next cycle must beat.
+      test: ["CMD", "python", "-c", "import sys,time; sys.exit(0 if time.time() < float(open('/app/heartbeat').read()) else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 2
+      start_period: 5m

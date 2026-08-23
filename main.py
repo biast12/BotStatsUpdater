@@ -34,10 +34,45 @@ TRANSIENT_ERRORS = (discord.DiscordException, aiohttp.ClientError, asyncio.Timeo
 
 CHANNEL_NAME_LIMIT = 100
 CHANNEL_PLACEHOLDER = re.compile(r'\{(\w+)(:,)?\}')
+CHANNEL_CONDITIONAL = re.compile(
+    r'\{if\s+(\w+)\s*(?:(>=|<=|==|!=|>|<)\s*(-?\d+))?\s*\}(.*?)(?:\{else\}(.*?))?\{end\}',
+    re.DOTALL,
+)
+
+_COMPARISONS = {
+    '>': lambda a, b: a > b,
+    '<': lambda a, b: a < b,
+    '>=': lambda a, b: a >= b,
+    '<=': lambda a, b: a <= b,
+    '==': lambda a, b: a == b,
+    '!=': lambda a, b: a != b,
+}
+
+
+def _condition_holds(key: str, op: Optional[str], threshold: Optional[str],
+                     values: Dict[str, Any]) -> Optional[bool]:
+    """True/False, or None when the condition cannot be evaluated at all."""
+    if key not in values:
+        return None
+    value = values[key]
+    if op is None:
+        return bool(value)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    return _COMPARISONS[op](value, int(threshold))
 
 
 def render_channel_name(fmt: str, values: Dict[str, Any]) -> str:
-    """Substitute {name} and {name:,} placeholders, leaving unknown ones literal."""
+    """
+    Anything unrecognised is left literal rather than raising. Nested
+    conditionals are not supported.
+    """
+    def resolve_block(match: re.Match) -> str:
+        holds = _condition_holds(match.group(1), match.group(2), match.group(3), values)
+        if holds is None:
+            return match.group(0)
+        return (match.group(4) if holds else match.group(5)) or ''
+
     def substitute(match: re.Match) -> str:
         key, thousands = match.group(1), match.group(2)
         if key not in values:
@@ -45,7 +80,7 @@ def render_channel_name(fmt: str, values: Dict[str, Any]) -> str:
         value = values[key]
         return f"{value:,}" if thousands and isinstance(value, int) else str(value)
 
-    return CHANNEL_PLACEHOLDER.sub(substitute, fmt)
+    return CHANNEL_PLACEHOLDER.sub(substitute, CHANNEL_CONDITIONAL.sub(resolve_block, fmt))
 
 
 class BotStatsUpdater:
@@ -380,7 +415,7 @@ class BotStatsManager:
         if not fmt:
             channel_name = f"{session.label}: {server_count}"
         else:
-            channel_name = render_channel_name(fmt, {
+            rendered = render_channel_name(fmt, {
                 'server_count': server_count,
                 'count': server_count,
                 'shard_count': shard_count,
@@ -388,8 +423,11 @@ class BotStatsManager:
                 'bot_name': session.label,
                 'bot_id': session.bot_id or '',
             })
-            if channel_name == fmt:
+            if rendered == fmt:
                 channel_name = f"{fmt}{server_count}"
+            else:
+                # All-conditional formats can render to nothing, which Discord rejects.
+                channel_name = rendered.strip() or f"{session.label}: {server_count}"
 
         if len(channel_name) > CHANNEL_NAME_LIMIT:
             logger.warning(LogArea.CHANNEL,

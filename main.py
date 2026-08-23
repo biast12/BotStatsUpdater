@@ -8,6 +8,7 @@ Counts are read over REST, never the gateway, so sharded and unsharded bots
 take the same code path.
 """
 
+import re
 import sys
 import json
 import asyncio
@@ -30,6 +31,21 @@ GUILD_PAGE_LIMIT = 500
 CHANNEL_RENAME_COOLDOWN_SECONDS = 300
 
 TRANSIENT_ERRORS = (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError, OSError)
+
+CHANNEL_NAME_LIMIT = 100
+CHANNEL_PLACEHOLDER = re.compile(r'\{(\w+)(:,)?\}')
+
+
+def render_channel_name(fmt: str, values: Dict[str, Any]) -> str:
+    """Substitute {name} and {name:,} placeholders, leaving unknown ones literal."""
+    def substitute(match: re.Match) -> str:
+        key, thousands = match.group(1), match.group(2)
+        if key not in values:
+            return match.group(0)
+        value = values[key]
+        return f"{value:,}" if thousands and isinstance(value, int) else str(value)
+
+    return CHANNEL_PLACEHOLDER.sub(substitute, fmt)
 
 
 class BotStatsUpdater:
@@ -329,14 +345,13 @@ class BotStatsManager:
         logger.info(LogArea.API, f"[{session.label}] Discord recommends {recommended} shard(s)")
         return max(1, int(recommended))
 
-    async def _update_server_count_channel(self, session: BotSession, server_count: int):
+    async def _update_server_count_channel(self, session: BotSession, server_count: int,
+                                           shard_count: int, member_count: int):
         """
         Rename a channel to reflect the current server count.
 
-        server_count_channel_id     - voice or text channel to rename
-        server_count_channel_format - uses {count} as placeholder; defaults to
-                                      "<bot name>: <count>". Without {count} the
-                                      count is appended.
+        A format with no recognised placeholder gets the count appended; the README
+        documents the placeholders.
         """
         bot_config = session.config
         channel_id_str = bot_config.get('server_count_channel_id', '')
@@ -362,13 +377,25 @@ class BotStatsManager:
                 return
 
         fmt = bot_config.get('server_count_channel_format', '')
-        if fmt:
-            if '{count}' in fmt:
-                channel_name = fmt.replace('{count}', str(server_count))
-            else:
-                channel_name = f"{fmt}{server_count}"
-        else:
+        if not fmt:
             channel_name = f"{session.label}: {server_count}"
+        else:
+            channel_name = render_channel_name(fmt, {
+                'server_count': server_count,
+                'count': server_count,
+                'shard_count': shard_count,
+                'member_count': member_count,
+                'bot_name': session.label,
+                'bot_id': session.bot_id or '',
+            })
+            if channel_name == fmt:
+                channel_name = f"{fmt}{server_count}"
+
+        if len(channel_name) > CHANNEL_NAME_LIMIT:
+            logger.warning(LogArea.CHANNEL,
+                           f"[{session.label}] channel name is {len(channel_name)} chars, "
+                           f"truncating to Discord's {CHANNEL_NAME_LIMIT}")
+            channel_name = channel_name[:CHANNEL_NAME_LIMIT]
 
         try:
             # No gateway means no channel cache, so always fetch.
@@ -409,7 +436,7 @@ class BotStatsManager:
 
         shard_count = await self._resolve_shard_count(session)
 
-        await self._update_server_count_channel(session, guild_count)
+        await self._update_server_count_channel(session, guild_count, shard_count, member_count)
 
         results = await session.updater.update_all(
             server_count=guild_count,

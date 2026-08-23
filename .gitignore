@@ -1,6 +1,9 @@
 # Config files with sensitive tokens
 config.json
 
+# Runtime liveness stamp for the Docker healthcheck
+heartbeat
+
 # Python
 __pycache__/
 *.py[cod]

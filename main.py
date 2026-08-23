@@ -21,10 +21,13 @@ import discord
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from logger import BotLogger, LogArea
+from logger import BotLogger, LogArea, LogLevel
 logger = BotLogger.get_instance()
 
 REQUEST_TIMEOUT_SECONDS = 15
+ALERT_FLUSH_SECONDS = 10
+ALERT_MAX_CHARS = 1800
+HEARTBEAT_GRACE_SECONDS = 300
 GUILD_PAGE_SIZE = 200
 GUILD_PAGE_LIMIT = 500
 # Discord allows 2 renames per 10 min; a 5-min gap stays clear of it.
@@ -83,6 +86,51 @@ def render_channel_name(fmt: str, values: Dict[str, Any]) -> str:
     return CHANNEL_PLACEHOLDER.sub(substitute, CHANNEL_CONDITIONAL.sub(resolve_block, fmt))
 
 
+class AlertDispatcher:
+    """Batches the log lines the sink feeds it and posts them to a Discord webhook."""
+
+    def __init__(self, webhook_url: str, session: aiohttp.ClientSession):
+        self.webhook_url = webhook_url
+        self.session = session
+        self._pending: List[str] = []
+        self._task: Optional[asyncio.Task] = None
+
+    def collect(self, level: LogLevel, area: LogArea, message: str) -> None:
+        self._pending.append(f"[{level.value}] [{area.value}] {message}")
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        await self._flush()
+
+    async def _run(self) -> None:
+        while True:
+            await asyncio.sleep(ALERT_FLUSH_SECONDS)
+            await self._flush()
+
+    async def _flush(self) -> None:
+        if not self._pending:
+            return
+        lines, self._pending = self._pending, []
+        body = "\n".join(lines)[:ALERT_MAX_CHARS]
+        try:
+            async with self.session.post(self.webhook_url,
+                                         json={"content": f"```\n{body}\n```"}) as response:
+                if response.status >= 400:
+                    self._report(f"HTTP {response.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self._report(f"{type(e).__name__}: {e}")
+
+    @staticmethod
+    def _report(problem: str) -> None:
+        # print, not logger: logging here would feed straight back into this sink.
+        print(f"alert webhook failed: {problem}", flush=True)
+
+
 class BotStatsUpdater:
     """Handles updating bot statistics across multiple bot list platforms"""
 
@@ -139,25 +187,37 @@ class BotStatsUpdater:
         except (TypeError, ValueError):
             return 2.0
 
-    async def update_topgg(self, server_count: int, shard_count: int) -> Optional[bool]:
-        """Returns True sent, False failed, None when no token is configured."""
+    async def update_topgg(self, server_count: Optional[int] = None,
+                           shard_count: Optional[int] = None,
+                           user_install_count: Optional[int] = None) -> Optional[bool]:
+        """Returns True sent, False failed, None when there is nothing to send."""
         if not self.topgg_token:
             return None
 
-        # This route is a PATCH, so an omitted field keeps its old value; always
-        # send shard_count rather than letting a stale one stand.
-        payload: Dict[str, Any] = {
-            "server_count": server_count,
-            "shard_count": shard_count,
-        }
+        # A PATCH leaves omitted fields at their old value, which is what makes the
+        # per-metric gates work: a disabled metric is left alone, not zeroed.
+        payload: Dict[str, Any] = {}
+        if server_count is not None:
+            payload["server_count"] = server_count
+        if shard_count is not None:
+            payload["shard_count"] = shard_count
+        if user_install_count is not None:
+            payload["user_install_count"] = user_install_count
+
+        if not payload:
+            logger.warning(LogArea.API,
+                           f"[{self.label}] every top.gg metric is disabled, nothing to send")
+            return None
 
         return await self._send("PATCH", self.topgg_stats_url,
                                 auth=f"Bearer {self.topgg_token}",
                                 payload=payload, what="top.gg metrics")
 
-    async def update_dbl(self, guilds: int, users: Optional[int] = None) -> Optional[bool]:
-        """Returns True sent, False failed, None when no token is configured."""
-        if not self.dbl_token:
+    async def update_dbl(self, guilds: Optional[int],
+                         users: Optional[int] = None) -> Optional[bool]:
+        """Returns True sent, False failed, None when there is nothing to send."""
+        # guilds is the whole point of this listing, so no count means no post.
+        if not self.dbl_token or guilds is None:
             return None
 
         payload: Dict[str, Any] = {"guilds": guilds}
@@ -168,10 +228,13 @@ class BotStatsUpdater:
                                 auth=self.dbl_token,
                                 payload=payload, what="discordbotlist.com stats")
 
-    async def update_all(self, server_count: int, shard_count: int,
-                         users: Optional[int] = None) -> Dict[str, Optional[bool]]:
+    async def update_all(self, server_count: Optional[int] = None,
+                         shard_count: Optional[int] = None,
+                         users: Optional[int] = None,
+                         user_install_count: Optional[int] = None) -> Dict[str, Optional[bool]]:
         topgg, dbl = await asyncio.gather(
-            self.update_topgg(server_count=server_count, shard_count=shard_count),
+            self.update_topgg(server_count=server_count, shard_count=shard_count,
+                              user_install_count=user_install_count),
             self.update_dbl(guilds=server_count, users=users),
         )
         return {"topgg": topgg, "dbl": dbl}
@@ -303,6 +366,7 @@ class BotStatsManager:
         self.sessions: List[BotSession] = []
         self.http: Optional[aiohttp.ClientSession] = None
         self.scheduler = AsyncIOScheduler()
+        self.alerts: Optional[AlertDispatcher] = None
         self._channel_last_updated: Dict[int, datetime] = {}
 
     def _load_config(self) -> Dict[str, Any]:
@@ -380,14 +444,38 @@ class BotStatsManager:
         logger.info(LogArea.API, f"[{session.label}] Discord recommends {recommended} shard(s)")
         return max(1, int(recommended))
 
-    async def _update_server_count_channel(self, session: BotSession, server_count: int,
-                                           shard_count: int, member_count: int):
-        """
-        Rename a channel to reflect the current server count.
+    async def _fetch_install_count(self, session: BotSession) -> Optional[int]:
+        """Refetched each cycle because client.application is only a login snapshot."""
+        try:
+            app = await session.client.application_info()
+        except Exception as e:
+            logger.warning(LogArea.API,
+                           f"[{session.label}] could not read install count "
+                           f"({type(e).__name__}: {e})")
+            return None
+        return app.approximate_user_install_count
 
-        A format with no recognised placeholder gets the count appended; the README
-        documents the placeholders.
+    def _write_heartbeat(self) -> None:
+        """Stamp the deadline the next cycle must beat; the Docker healthcheck reads it."""
+        path = self.config.get('heartbeat_file', 'heartbeat')
+        if not path:
+            return
+        interval = int(self.config.get('update_interval_minutes', 30))
+        deadline = datetime.now(timezone.utc).timestamp() + interval * 120 + HEARTBEAT_GRACE_SECONDS
+        try:
+            with open(path, 'w') as f:
+                f.write(str(deadline))
+        except OSError as e:
+            logger.warning(LogArea.SCHEDULER, f"could not write heartbeat file {path}: {e}")
+
+    async def _update_server_count_channel(self, session: BotSession, values: Dict[str, Any]):
         """
+        Rename a channel to reflect the current stats.
+
+        A format with no recognised placeholder gets the server count appended; the
+        README documents the placeholders.
+        """
+        server_count = values['server_count']
         bot_config = session.config
         channel_id_str = bot_config.get('server_count_channel_id', '')
         if not channel_id_str:
@@ -415,14 +503,7 @@ class BotStatsManager:
         if not fmt:
             channel_name = f"{session.label}: {server_count}"
         else:
-            rendered = render_channel_name(fmt, {
-                'server_count': server_count,
-                'count': server_count,
-                'shard_count': shard_count,
-                'member_count': member_count,
-                'bot_name': session.label,
-                'bot_id': session.bot_id or '',
-            })
+            rendered = render_channel_name(fmt, values)
             if rendered == fmt:
                 channel_name = f"{fmt}{server_count}"
             else:
@@ -473,14 +554,27 @@ class BotStatsManager:
             return
 
         shard_count = await self._resolve_shard_count(session)
+        install_count = await self._fetch_install_count(session)
 
-        await self._update_server_count_channel(session, guild_count, shard_count, member_count)
+        await self._update_server_count_channel(session, {
+            'server_count': guild_count,
+            'count': guild_count,
+            'shard_count': shard_count,
+            'member_count': member_count,
+            'user_install_count': install_count or 0,
+            'bot_name': session.label,
+            'bot_id': session.bot_id or '',
+        })
+
+        report_servers = session.config.get('report_server_count', True)
+        report_installs = session.config.get('report_user_installs', True)
 
         results = await session.updater.update_all(
-            server_count=guild_count,
-            shard_count=shard_count,
+            server_count=guild_count if report_servers else None,
+            shard_count=shard_count if report_servers else None,
             # 0 would overwrite the listing's real figure, so omit it instead.
-            users=member_count or None,
+            users=(member_count or None) if report_servers else None,
+            user_install_count=install_count if report_installs else None,
         )
         self._log_results(session, results)
 
@@ -510,6 +604,8 @@ class BotStatsManager:
                                 f"[{session.label}] update cycle crashed: "
                                 f"{type(outcome).__name__}: {outcome}")
 
+        self._write_heartbeat()
+
         logger.spacer()
         logger.info(LogArea.SCHEDULER, "Stats update completed")
         logger.spacer()
@@ -521,6 +617,13 @@ class BotStatsManager:
         self.http = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=5),
         )
+
+        webhook_url = self.config.get('alert_webhook_url', '')
+        if webhook_url:
+            self.alerts = AlertDispatcher(webhook_url, self.http)
+            logger.set_sink(self.alerts.collect)
+            self.alerts.start()
+            logger.info(LogArea.STARTUP, "Alerting errors to the configured webhook")
 
         self.sessions = [BotSession(index=i, config=bot_config)
                          for i, bot_config in enumerate(self.config.get('bots', []))]
@@ -577,6 +680,10 @@ class BotStatsManager:
             except Exception as e:
                 logger.warning(LogArea.SHUTDOWN,
                                f"[{session.label}] close failed: {type(e).__name__}: {e}")
+
+        if self.alerts is not None:
+            await self.alerts.stop()
+            logger.set_sink(None)
 
         if self.http is not None:
             await self.http.close()

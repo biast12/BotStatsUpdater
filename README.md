@@ -45,6 +45,7 @@ When `server_count_channel_id` is set, the bot will rename that channel on every
 | `"Servers: {server_count} {shard_count}"` | `Servers: 2553 3` |
 | `"{server_count:,} servers / {shard_count} shards"` | `2,553 servers / 3 shards` |
 | `"{bot_name}: {member_count:,} users"` | `PurgeBot: 655,270 users` |
+| `"Servers: {server_count:,}{if shard_count > 1} │ Shards: {shard_count}{end}"` | `Servers: 2,553 │ Shards: 3`, or `Servers: 493` for an unsharded bot |
 | `"My Bot: "` | `My Bot: 2553` |
 
 **Available placeholders:**
@@ -59,6 +60,17 @@ When `server_count_channel_id` is set, the bot will rename that channel on every
 | `{bot_id}` | The bot's user ID |
 
 Add `:,` inside any numeric placeholder for thousands separators: `{member_count:,}` → `655,270`.
+
+**Conditional sections:**
+
+```
+{if shard_count > 1} | Shards: {shard_count}{end}
+{if shard_count > 1}Shards: {shard_count}{else}Unsharded{end}
+```
+
+`{if <placeholder> <op> <number>}` … optional `{else}` … `{end}`, where `<op>` is one of `>` `<` `>=` `<=` `==` `!=`. Omit the operator for a plain truthy test: `{if member_count}…{end}`.
+
+Keep the separator *inside* the block, so dropping the block doesn't leave a dangling `|`. Nested conditionals are not supported, and a condition that can't be evaluated is left in the name as written.
 
 If the format string contains no recognised placeholder, the server count is appended to the end. Unrecognised placeholders are left as-is, so a typo shows up in the channel name rather than crashing.
 

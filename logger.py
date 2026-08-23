@@ -111,6 +111,3 @@ class BotLogger:
         line   = char * width
         c      = color if color is not None else _CYAN
         print(f"{c}{line}{_RESET}", flush=True)
-
-
-logger = BotLogger.get_instance()

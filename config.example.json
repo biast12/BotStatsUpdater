@@ -1,11 +1,19 @@
 {
   "update_interval_minutes": 30,
+  "max_attempts": 2,
+  "attempt_delay_seconds": 2,
+  "alert_webhook_url": "",
+  "alert_after_failures": 1,
+  "heartbeat_file": "heartbeat",
   "bots": [
     {
       "bot_token": "",
+      "name": "",
       "topgg_token": "",
       "dbl_token": "",
       "shard_count": 6,
+      "report_server_count": true,
+      "report_user_installs": true,
       "server_count_channel_id": "",
       "server_count_channel_format": "Servers: {count}"
     },

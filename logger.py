@@ -33,6 +33,7 @@ _LEVEL_ORDER = [
     LogLevel.NONE,
 ]
 
+# Adding WARNING here would defeat main.py's alert_after_failures gate.
 _SINK_LEVELS = frozenset({LogLevel.ERROR, LogLevel.CRITICAL})
 
 _COLORS = {

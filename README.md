@@ -11,6 +11,7 @@ It talks to Discord over REST only and never connects to the gateway, so it need
 - Slash commands synced to both listings
 - Optional channel that gets renamed with your live server count
 - Optional Discord webhook alerts when something goes wrong
+- Configurable retries on logins, counts and listing posts
 - Docker support with a healthcheck
 
 ## Installation
@@ -71,7 +72,10 @@ The config is read once at startup, so restart the bot after editing it.
 ### Global options
 
 - `update_interval_minutes`: How often to update stats (default: `30`). One update also runs immediately at startup.
+- `max_attempts`: How many times each retryable step is tried before it gives up (default: `2`, maximum `5`). `1` disables retrying. See [Retries](#retries).
+- `attempt_delay_seconds`: Seconds to wait between attempts (default: `2`, maximum `60`). This is a *floor*: every retry waits this plus up to 25% jitter, and when a platform answers `429` with a `Retry-After`, the longer of the two is used.
 - `alert_webhook_url`: Discord webhook that receives `ERROR` and `CRITICAL` log lines, batched every 10s (default: none). Without it, a revoked token only shows up in `docker logs`.
+- `alert_after_failures`: How many times in a row something must fail before it reaches the webhook (default: `1`, meaning alert straight away). `2` stays quiet about a one-off blip and only tells you once it has failed twice running. A success resets the count. See [Alert volume](#alert-volume).
 - `heartbeat_file`: File stamped after each cycle, read by the Docker healthcheck (default: `heartbeat`). Set to `""` to disable.
 
 ### Per-bot options
@@ -103,6 +107,68 @@ Switching both off leaves nothing to send, which is logged and skipped. The serv
 ### Slash Commands
 
 Each update also pushes the bot's global slash commands to both listings, so their command lists stay in sync with what the bot actually has. Subcommands are flattened first, since neither site shows nested commands — `/config set` is listed as `config set`. Guild-only commands are not included.
+
+## Retries
+
+Anything that talks to Discord or a listing site is tried up to `max_attempts` times, waiting `attempt_delay_seconds` between attempts.
+
+| Step | Retried | When it gives up |
+|---|---|---|
+| Discord login | Yes | The bot is skipped this cycle and tried again on the next one |
+| Server count | Yes — the failing page is re-fetched and the walk resumes where it stopped | The whole bot is skipped; a partial count is never posted |
+| Slash command fetch | Yes | Commands are not synced this cycle; the stats posted above still count |
+| Posts to top.gg / discordbotlist.com | Yes | That post is logged `[FAIL]` |
+| Server count channel rename | No | The rename is skipped and retried next cycle |
+| Shard count | No | Falls back to `1` |
+| User install count | No | Left out of the payload, so the listing keeps its previous figure |
+
+Some failures will never succeed on a second try, so they are not retried at all:
+
+| Condition | Why |
+|---|---|
+| `401` / `403` from a listing | The token is wrong — logged `CRITICAL`, so it reaches your alert webhook |
+| Any other `4xx` that is not `429` | The request itself is wrong |
+| Discord rejects the bot token at login | The bot is disabled for the rest of the run, so a revoked token costs no requests |
+| `bot_token` missing | Config error |
+
+If Discord rejects an *already logged-in* bot with a `401` — which is what resetting the token in the developer portal looks like — the session is dropped and the bot logs in again on the next cycle.
+
+**Rate limits.** On a `429` the wait is the longer of `attempt_delay_seconds` and the platform's `Retry-After`, plus a little jitter so several bots that fail at the same moment don't all retry in lockstep. If a platform asks for longer than two minutes, the step is skipped until the next cycle rather than retried early. Discord's own client already retries internally, so these attempts sit on top of that — `2` is usually enough, and `5` is the maximum.
+
+**Retries never delay the schedule.** A cycle stops retrying once it has used 80% of `update_interval_minutes`, so retries can't push a cycle past its next tick and silently skip it. If `max_attempts` and `attempt_delay_seconds` can't fit in that budget, a warning is logged at startup telling you which one to change.
+
+**Retries don't spam your webhook.** Individual attempts are logged at `WARNING`, which is console-only; only the final failure of a step is `ERROR`. Raising `max_attempts` therefore adds no webhook traffic at all. The trade-off is that a call which fails once and then succeeds no longer reaches the webhook — look in `docker logs` for `retrying in` and `succeeded on attempt` to spot a platform that is flapping.
+
+## Alert volume
+
+Two separate things decide how much lands in your webhook, and they work at different timescales.
+
+**Within one cycle**, `max_attempts` costs you nothing. Each attempt logs at `WARNING` (console only) and only the final give-up is `ERROR`, so a step that fails and then succeeds sends nothing at all, and a step that fails outright sends exactly one line whether `max_attempts` is 2 or 5.
+
+**Across cycles** is what `alert_after_failures` controls. A platform that stays down fails once per cycle, every cycle, so at the default of `1` an overnight top.gg outage fills your webhook. Raise it and a step has to fail that many cycles in a row before it says anything:
+
+| `alert_after_failures` | What reaches the webhook |
+|---|---|
+| `1` (default) | Every failed cycle, immediately |
+| `2` | Nothing until it has failed twice running — a single bad cycle stays silent |
+| `3` | Nothing until the third consecutive failure |
+
+At `update_interval_minutes: 30`, setting `3` means roughly "don't tell me unless it has been broken for an hour and a half".
+
+It delays the *first* alert; it does not thin out the ones after it. Once a step has crossed the threshold it reports every failed cycle until it recovers, so a 12-hour top.gg outage at a 30-minute interval sends 22 messages with `3` instead of 24 with `1`. The setting is there to stop a one-off blip waking you, not to summarise an ongoing outage.
+
+The count is kept **per bot and per step**, so one bot failing does not bring another closer to alerting, and a failing top.gg post does not count towards the server-count step. Any success clears that step's count back to zero.
+
+Suppressed failures are never hidden from you locally — they log to the console at `WARNING` with the running count, e.g. `... (failure 1 of 3 before alerting)`.
+
+**What this never delays.** `CRITICAL` ignores `alert_after_failures` entirely and always goes out on the first occurrence, because none of it heals on its own:
+
+- a listing rejecting your token (`401` / `403`)
+- Discord rejecting the bot token at login
+- a missing `bot_token`
+- an update cycle crashing outright
+
+So raising the threshold stops brief hiccups reaching you, without ever delaying the news that something is genuinely, permanently broken.
 
 ## Server Count Channel
 

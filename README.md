@@ -11,6 +11,7 @@ It talks to Discord over REST only and never connects to the gateway, so it need
 - Slash commands synced to both listings
 - Optional channel that gets renamed with your live server count
 - Optional Discord webhook alerts when something goes wrong
+- Optional read-only stats API on a localhost port
 - Configurable retries on logins, counts and listing posts
 - Docker support with a healthcheck
 
@@ -77,6 +78,7 @@ The config is read once at startup, so restart the bot after editing it.
 - `alert_webhook_url`: Discord webhook that receives `ERROR` and `CRITICAL` log lines, batched every 10s (default: none). Without it, a revoked token only shows up in `docker logs`.
 - `alert_after_failures`: How many times in a row something must fail before it reaches the webhook (default: `1`, meaning alert straight away). `2` stays quiet about a one-off blip and only tells you once it has failed twice running. A success resets the count. See [Alert volume](#alert-volume).
 - `heartbeat_file`: File stamped after each cycle, read by the Docker healthcheck (default: `heartbeat`). Set to `""` to disable.
+- `api`: Read-only HTTP stats API, off by default. See [Stats API](#stats-api).
 
 ### Per-bot options
 
@@ -87,7 +89,7 @@ The config is read once at startup, so restart the bot after editing it.
 | `topgg_token` | No | Top.gg API token. Leave it out to skip top.gg for this bot. |
 | `dbl_token` | No | DiscordBotList.com API token. Leave it out to skip discordbotlist.com for this bot. |
 | `shard_count` | No | Number of shards this bot actually runs. Omit to report Discord's recommended count. |
-| `report_server_count` | No | `false` stops reporting servers/shards, and skips discordbotlist.com entirely. Use it for a user-install-only app (default: `true`). |
+| `report_server_count` | No | `false` stops reporting servers/shards, so discordbotlist.com's stats post is skipped too (its command sync still runs). Use it for a user-install-only app (default: `true`). |
 | `report_user_installs` | No | `false` stops reporting user-app installs to top.gg (default: `true`). |
 | `server_count_channel_id` | No | ID of a voice/text channel to rename with the server count |
 | `server_count_channel_format` | No | Custom format for the channel name (see below) |
@@ -115,7 +117,7 @@ Anything that talks to Discord or a listing site is tried up to `max_attempts` t
 | Step | Retried | When it gives up |
 |---|---|---|
 | Discord login | Yes | The bot is skipped this cycle and tried again on the next one |
-| Server count | Yes — the failing page is re-fetched and the walk resumes where it stopped | The whole bot is skipped; a partial count is never posted |
+| Server count | Yes — the failing page is re-fetched and the walk resumes where it stopped | The whole bot is skipped; a count short because of a *failure* is never posted. A bot in more than ~100,000 servers hits the 500-page walk cap, which logs a warning and does post the short count. |
 | Slash command fetch | Yes | Commands are not synced this cycle; the stats posted above still count |
 | Posts to top.gg / discordbotlist.com | Yes | That post is logged `[FAIL]` |
 | Server count channel rename | No | The rename is skipped and retried next cycle |
@@ -216,6 +218,112 @@ Names longer than Discord's 100-character limit are truncated, with a warning lo
 > **Rate limits:** Discord allows only 2 channel renames per 10 minutes per channel. A 5-minute cooldown is enforced automatically — if an update cycle runs before the cooldown expires, the rename is skipped and a warning is logged.
 
 The bot requires the **Manage Channels** permission in the channel's server for this feature to work.
+
+## Stats API
+
+An optional read-only HTTP API serving your bots' live stats. Off by default, no new dependency.
+
+```json
+"api": {
+  "enabled": true,
+  "port": 8080
+}
+```
+
+```bash
+curl localhost:8080/
+```
+
+```json
+{
+  "updated_at": "2026-09-16T20:26:54Z",
+  "next_update_at": "2026-09-16T20:56:54Z",
+  "totals": {
+    "bots": 3,
+    "server_count": 3324,
+    "member_count": 1266066,
+    "user_install_count": 2408
+  },
+  "bots": [
+    {
+      "id": "735842810982203483",
+      "name": "PurgeBot",
+      "status": "ok",
+      "server_count": 2776,
+      "member_count": 807233,
+      "shard_count": 3,
+      "user_install_count": 1204,
+      "command_count": 5,
+      "channel_name": "Servers: 2776",
+      "updated_at": "2026-09-16T20:26:54Z"
+    }
+  ]
+}
+```
+
+That is the whole default payload — no tokens, paths or error text, so it is safe to expose. `status` is `ok`, `degraded`, `disabled`, `never_logged_in`, `starting` or `unknown`.
+
+A bot's `updated_at` is when its figures were measured. One that fails before counting keeps its last good numbers rather than going blank, so a stale timestamp means that bot is stuck.
+
+### Options
+
+| Key | Default | |
+|---|---|---|
+| `enabled` | `false` | Must be a real `true`, not `"true"`. |
+| `host` | *(automatic)* | `127.0.0.1`, or `0.0.0.0` in a container. Leave it out — see [Docker](#docker-1). |
+| `port` | `8080` | |
+| `token` | `""` | Set it and every request needs `Authorization: Bearer <token>`. |
+| `detailed` | `false` | Adds the operational fields, see below. |
+| `history_size` | `48` | Cycles kept per bot, in memory. `0` turns history off. |
+| `allow_refresh` | `false` | Enables `POST /refresh`. |
+
+### Endpoints
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/` | Totals and every bot |
+| `GET` | `/<bot>` | One bot |
+| `GET` | `/<bot>/history` | That bot's recent cycles |
+| `GET` | `/health` | `{"status": "..."}` and a status code to alert on |
+| `POST` | `/refresh` | Run a cycle now — `202`, or `409` if one is already running. Does not move the schedule. |
+
+`<bot>` is the Discord ID or the ref `bot-1`, `bot-2`, … as they appear in `bots`. The ref is the only handle a bot with a bad token has, since it never logs in. Names are not accepted: two bots can share one, and renaming a bot would change its address.
+
+`?compact=1` minifies; `?brief=1` on `/health` cuts the body to the status. Both read `0`, `false`, `no` and `off` as off.
+
+Errors are `{"error": "<code>"}` — `401 unauthorized` (on every path, including `/health`), `404 not_found`, `405 method_not_allowed`, `500 internal_error`.
+
+### Detailed mode
+
+`"detailed": true` adds a `service` block, a `problems` list, and a `detail` object per bot with per-listing results, failure streaks, channel state and last-cycle outcome. `/health` gains `checks` and `problems`.
+
+`report_server_count: false` does not stop the servers being counted — that number still renames your channel and still appears above. It only controls what is sent to the listings, which is `detail.reporting`.
+
+No token or webhook URL appears in either mode, and error text is scrubbed before it is stored.
+
+### Health
+
+| Status | HTTP | |
+|---|---|---|
+| `starting` | 200 | No cycle has finished yet |
+| `ok` | 200 | Every check passed |
+| `degraded` | 200 | Something is failing, but the app works |
+| `down` | 503 | Cycles have stopped, or a bot is disabled by a bad token |
+
+A failing listing post is `degraded`, never `down` — an outage at top.gg should not restart your container. Staleness uses the heartbeat's own deadline, so `/health` and `docker ps` cannot disagree; the Docker healthcheck stays on the file, which keeps working when the API is off.
+
+### Docker
+
+Omit `host` — it binds `0.0.0.0` inside the container on its own. Add the published port:
+
+```yaml
+ports:
+  - "127.0.0.1:8080:8080"
+```
+
+Keep the `127.0.0.1:` prefix; a bare `"8080:8080"` publishes on every interface. Setting `"host": "127.0.0.1"` binds the *container's* own loopback, so Docker forwards the port to nothing and `curl` returns an empty reply — the app detects this and logs an `ERROR` naming the fix.
+
+If the port is taken or `host` is unusable, the API logs one error and the app carries on without it.
 
 ## License
 

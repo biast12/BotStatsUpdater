@@ -26,6 +26,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from logger import BotLogger, LogArea, LogLevel
+from api import (BotCycleRecord, BotStats, ChannelOutcome, StatsAPI, redact,
+                 default_api_host, DEFAULT_API_PORT, MIN_API_PORT, MAX_API_PORT,
+                 DEFAULT_API_HISTORY, MAX_API_HISTORY)
 logger = BotLogger.get_instance()
 
 REQUEST_TIMEOUT_SECONDS = 15
@@ -110,6 +113,35 @@ def render_channel_name(fmt: str, values: Dict[str, Any]) -> str:
 
 _MISSING = object()
 
+# Replayed by the API; the console copy scrolls away.
+CONFIG_WARNINGS: List[str] = []
+
+
+def _config_warn(message: str) -> None:
+    CONFIG_WARNINGS.append(message)
+    logger.warning(LogArea.CONFIG, message)
+
+
+def _config_flag(config: Dict[str, Any], key: str, default: bool) -> bool:
+    """Only a real JSON boolean counts: the string "false" is truthy."""
+    value = config.get(key, _MISSING)
+    if value is _MISSING:
+        return default
+    if not isinstance(value, bool):
+        _config_warn(f"{key}={value!r} is not true or false, using {str(default).lower()}")
+        return default
+    return value
+
+
+def _config_text(config: Dict[str, Any], key: str, default: str) -> str:
+    value = config.get(key, _MISSING)
+    if value is _MISSING:
+        return default
+    if not isinstance(value, str):
+        _config_warn(f"{key}={value!r} is not text, using {default!r}")
+        return default
+    return value
+
 
 def _config_number(config: Dict[str, Any], key: str, default: float,
                    minimum: float, maximum: float, *, integer: bool) -> float:
@@ -121,17 +153,17 @@ def _config_number(config: Dict[str, Any], key: str, default: float,
     # bool is an int subclass, so `true` would otherwise pass as 1.
     if isinstance(value, bool) or not isinstance(value, wanted):
         kind = "whole number" if integer else "number"
-        logger.warning(LogArea.CONFIG, f"{key}={value!r} is not a {kind}, using {default:g}")
+        _config_warn(f"{key}={value!r} is not a {kind}, using {default:g}")
         return default
     # json.load accepts bare NaN/Infinity, and asyncio.sleep(inf) never returns.
     if isinstance(value, float) and not math.isfinite(value):
-        logger.warning(LogArea.CONFIG, f"{key}={value!r} is not finite, using {default:g}")
+        _config_warn(f"{key}={value!r} is not finite, using {default:g}")
         return default
     if value < minimum:
-        logger.warning(LogArea.CONFIG, f"{key}={value} is below {minimum:g}, using {minimum:g}")
+        _config_warn(f"{key}={value} is below {minimum:g}, using {minimum:g}")
         return minimum
     if value > maximum:
-        logger.warning(LogArea.CONFIG, f"{key}={value} is above {maximum:g}, using {maximum:g}")
+        _config_warn(f"{key}={value} is above {maximum:g}, using {maximum:g}")
         return maximum
     return value if integer else float(value)
 
@@ -238,6 +270,10 @@ class AlertDispatcher:
         if len(self._pending) == ALERT_MAX_PENDING:
             self._overflowed += 1
         self._pending.append(f"[{level.value}] [{area.value}] {message}")
+
+    def stats(self) -> Dict[str, int]:
+        """Counts only; the buffered lines never leave the process."""
+        return {"pending": len(self._pending), "dropped": self._overflowed}
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())
@@ -516,7 +552,8 @@ class BotStatsUpdater:
                     flat.append({**option, 'name': f"{cmd['name']} {option['name']}"})
         return flat
 
-    async def sync_all_commands(self, commands: List[Dict[str, Any]]) -> Dict[str, Optional[bool]]:
+    async def sync_all_commands(self, commands: List[Dict[str, Any]]
+                                ) -> Tuple[Dict[str, Optional[bool]], int]:
         flat_commands = self._flatten_commands(commands)
         logger.info(LogArea.API,
                     f"[{self.label}] syncing {len(commands)} command(s) "
@@ -527,8 +564,9 @@ class BotStatsUpdater:
             self.sync_commands_dbl(flat_commands),
             return_exceptions=True,
         )
-        return {"topgg": self._settle("top.gg commands", topgg),
-                "dbl": self._settle("discordbotlist.com commands", dbl)}
+        return ({"topgg": self._settle("top.gg commands", topgg),
+                 "dbl": self._settle("discordbotlist.com commands", dbl)},
+                len(flat_commands))
 
 
 @dataclass
@@ -542,10 +580,17 @@ class BotSession:
     application_id: Optional[int] = None
     name: str = ""
     dead_reason: Optional[str] = None
+    stats: BotStats = field(default_factory=BotStats)
 
     @property
     def label(self) -> str:
         return self.name or self.config.get('name') or f"bot#{self.index + 1}"
+
+    @property
+    def ref(self) -> str:
+        """Stable and URL-safe, unlike label: that flips to the Discord username
+        at first login and its fallback contains a '#'."""
+        return f"bot-{self.index + 1}"
 
     async def ensure_login(self, session: aiohttp.ClientSession,
                            policy: RetryPolicy, gate: AlertGate) -> bool:
@@ -653,12 +698,78 @@ class BotStatsManager:
             self.config, 'alert_after_failures', DEFAULT_ALERT_AFTER_FAILURES,
             1, MAX_ALERT_AFTER_FAILURES, integer=True)))
         self._warn_if_retries_outlast_interval()
+        self._resolve_api_config()
+        self._learn_secrets()
 
         self.sessions: List[BotSession] = []
         self.http: Optional[aiohttp.ClientSession] = None
         self.scheduler = AsyncIOScheduler()
         self.alerts: Optional[AlertDispatcher] = None
+        self.api: Optional[StatsAPI] = None
         self._channel_last_updated: Dict[int, datetime] = {}
+
+        self.started_at = datetime.now(timezone.utc)
+        self.cycle_number = 0
+        self.last_cycle_number = 0
+        self.cycles_completed = 0
+        self.cycle_running = False
+        self.cycle_started_at: Optional[datetime] = None
+        self.last_cycle_started_at: Optional[datetime] = None
+        self.cycle_finished_at: Optional[datetime] = None
+        self.cycle_duration: Optional[float] = None
+        self.heartbeat_deadline: Optional[float] = None
+        self.heartbeat_ok: Optional[bool] = None
+        self._refresh_task: Optional[asyncio.Task] = None
+
+    def _resolve_api_config(self) -> None:
+        block = self.config.get('api')
+        if block is None:
+            block = {}
+        elif not isinstance(block, dict):
+            _config_warn(f"api={block!r} is not an object, the stats API stays off")
+            block = {}
+        # So a warning names the key as it appears in config.json.
+        block = {f"api.{key}": value for key, value in block.items()}
+
+        self.api_enabled = _config_flag(block, 'api.enabled', False)
+        self.api_port = int(_config_number(block, 'api.port', DEFAULT_API_PORT,
+                                           MIN_API_PORT, MAX_API_PORT, integer=True))
+        raw_token = block.get('api.token', '')
+        if not isinstance(raw_token, str):
+            # Not echoed: config_warnings is served in the detailed payload.
+            _config_warn("api.token is not text, continuing without auth")
+            raw_token = ''
+        # The request side strips too, so a stray space here would lock you out.
+        self.api_token = raw_token.strip()
+        self.api_allow_refresh = _config_flag(block, 'api.allow_refresh', False)
+        self.api_detailed = _config_flag(block, 'api.detailed', False)
+        self.history_size = int(_config_number(block, 'api.history_size',
+                                               DEFAULT_API_HISTORY, 0, MAX_API_HISTORY,
+                                               integer=True))
+        if not self.api_enabled:
+            self.history_size = 0  # nothing would ever read it
+        fallback = default_api_host()
+        self.api_host = _config_text(block, 'api.host', fallback).strip()
+        if not self.api_host:
+            _config_warn(f"api.host is empty, using {fallback}")
+            self.api_host = fallback
+
+    def _learn_secrets(self) -> None:
+        redact.learn(self.config.get('alert_webhook_url'))
+        redact.learn(self.api_token)
+        for bot in self.config.get('bots') or []:
+            if isinstance(bot, dict):
+                for key in ('bot_token', 'topgg_token', 'dbl_token'):
+                    redact.learn(bot.get(key))
+
+    @property
+    def config_warnings(self) -> List[str]:
+        return CONFIG_WARNINGS
+
+    @property
+    def heartbeat_enabled(self) -> bool:
+        path = self.config.get('heartbeat_file', 'heartbeat')
+        return isinstance(path, str) and bool(path)
 
     def _load_config(self) -> Dict[str, Any]:
         try:
@@ -723,9 +834,9 @@ class BotStatsManager:
         with contextlib.suppress(Exception):
             await session.close()
 
-    async def _count_guilds(self, session: BotSession) -> Tuple[int, int]:
+    async def _count_guilds(self, session: BotSession) -> Tuple[int, int, int, bool]:
         """
-        Page GET /users/@me/guilds, returning (guilds, summed approximate members).
+        Page GET /users/@me/guilds, returning (guilds, members, pages, truncated).
 
         Short pages are NOT the last page and the same request can return a
         different count each time, so only an empty page ends the walk and IDs are
@@ -734,6 +845,7 @@ class BotStatsManager:
         after: Optional[int] = None
         seen: set = set()
         members = pages = 0
+        truncated = False
         attempt = 1  # one budget for the whole walk, not per page
 
         while pages < GUILD_PAGE_LIMIT:
@@ -770,6 +882,7 @@ class BotStatsManager:
                 break
             after = cursor
         else:
+            truncated = True
             logger.warning(LogArea.API,
                            f"[{session.label}] stopped at the {GUILD_PAGE_LIMIT}-page cap; "
                            f"count may be short")
@@ -777,27 +890,33 @@ class BotStatsManager:
         logger.info(LogArea.API,
                     f"[{session.label}] counted {len(seen)} guilds across {pages} page(s), "
                     f"{members} members")
-        return len(seen), members
+        return len(seen), members, pages, truncated
 
-    async def _resolve_shard_count(self, session: BotSession) -> int:
-        """Configured value if set, else Discord's recommendation. Unsharded means one shard."""
+    async def _resolve_shard_count(self, session: BotSession) -> Tuple[int, str, bool]:
+        """
+        Configured value if set, else Discord's recommendation, else one.
+
+        Also returns which of the three it was: once two sources agree the logs
+        cannot tell them apart.
+        """
         configured = session.config.get('shard_count')
         if isinstance(configured, int) and not isinstance(configured, bool) and configured >= 1:
             logger.info(LogArea.API, f"[{session.label}] shard_count {configured} from config")
-            return configured
+            return configured, 'config', False
 
+        ignored = configured is not None
         try:
             recommended, _url, _limits = await session.client.http.get_bot_gateway()
         except Exception as e:
             logger.warning(LogArea.API,
                            f"[{session.label}] could not read /gateway/bot "
                            f"({type(e).__name__}: {e}), reporting shard_count=1")
-            return 1
+            return 1, 'fallback', ignored
 
         logger.info(LogArea.API, f"[{session.label}] Discord recommends {recommended} shard(s)")
-        return max(1, int(recommended))
+        return max(1, int(recommended)), 'discord', ignored
 
-    async def _fetch_install_count(self, session: BotSession) -> Optional[int]:
+    async def _fetch_install_count(self, session: BotSession) -> Tuple[Optional[int], str]:
         """Refetched each cycle because client.application is only a login snapshot."""
         try:
             app = await session.client.application_info()
@@ -805,11 +924,21 @@ class BotStatsManager:
             logger.warning(LogArea.API,
                            f"[{session.label}] could not read install count "
                            f"({type(e).__name__}: {e})")
-            return None
-        return app.approximate_user_install_count
+            return None, 'error'
+        count = app.approximate_user_install_count
+        # Discord omits it for an app with no user installs, which is not a failure.
+        return (count, 'ok') if count is not None else (None, 'unavailable')
+
+    def _cycle_deadline(self) -> float:
+        """The time the next cycle must beat. One source, so the heartbeat file
+        and /health cannot disagree."""
+        return (datetime.now(timezone.utc).timestamp()
+                + self.interval_minutes * 120 + HEARTBEAT_GRACE_SECONDS)
 
     def _write_heartbeat(self) -> None:
         """Stamp the deadline the next cycle must beat; the Docker healthcheck reads it."""
+        # Before the path checks, so /health has a deadline even with the file off.
+        deadline = self.heartbeat_deadline = self._cycle_deadline()
         path = self.config.get('heartbeat_file', 'heartbeat')
         if not path:
             return
@@ -818,15 +947,17 @@ class BotStatsManager:
             logger.warning(LogArea.SCHEDULER,
                            f"heartbeat_file={path!r} is not a path, heartbeat disabled")
             return
-        deadline = (datetime.now(timezone.utc).timestamp()
-                    + self.interval_minutes * 120 + HEARTBEAT_GRACE_SECONDS)
         try:
             with open(path, 'w') as f:
                 f.write(str(deadline))
         except OSError as e:
+            self.heartbeat_ok = False
             logger.warning(LogArea.SCHEDULER, f"could not write heartbeat file {path}: {e}")
+        else:
+            self.heartbeat_ok = True
 
-    async def _update_server_count_channel(self, session: BotSession, values: Dict[str, Any]):
+    async def _update_server_count_channel(self, session: BotSession,
+                                           values: Dict[str, Any]) -> ChannelOutcome:
         """
         Rename a channel to reflect the current stats.
 
@@ -837,14 +968,14 @@ class BotStatsManager:
         bot_config = session.config
         channel_id_str = bot_config.get('server_count_channel_id', '')
         if not channel_id_str:
-            return
+            return ChannelOutcome('not_configured')
 
         try:
             channel_id = int(channel_id_str)
         except (ValueError, TypeError):
             logger.warning(LogArea.CHANNEL,
                            f"[{session.label}] invalid server_count_channel_id: {channel_id_str!r}")
-            return
+            return ChannelOutcome('invalid_id')
 
         now = datetime.now(timezone.utc)
         last_update = self._channel_last_updated.get(channel_id)
@@ -855,7 +986,7 @@ class BotStatsManager:
                 logger.warning(LogArea.CHANNEL,
                                f"[{session.label}] skipping channel rename: "
                                f"rate-limit cooldown ({remaining}s remaining)")
-                return
+                return ChannelOutcome('cooldown', cooldown_remaining=float(remaining))
 
         fmt = bot_config.get('server_count_channel_format', '')
         if not fmt:
@@ -882,15 +1013,19 @@ class BotStatsManager:
             _alert_failure(self.gate, LogArea.CHANNEL, f"{session.label}/channel rename",
                            f"[{session.label}] missing 'Manage Channel' permission "
                            f"for channel {channel_id}")
+            return ChannelOutcome('forbidden',
+                                  error="missing 'Manage Channel' permission")
         except TRANSIENT_ERRORS as e:
             _alert_failure(self.gate, LogArea.CHANNEL, f"{session.label}/channel rename",
                            f"[{session.label}] failed to rename channel {channel_id}: "
                            f"{type(e).__name__}: {e}")
+            return ChannelOutcome('failed', error=f"{type(e).__name__}: {e}")
         else:
             self.gate.recovered(f"{session.label}/channel rename")
             self._channel_last_updated[channel_id] = now
             logger.info(LogArea.CHANNEL,
                         f"[{session.label}] updated channel name to '{channel_name}'")
+            return ChannelOutcome('ok', name=channel_name, renamed_at=now)
 
     @staticmethod
     def _log_results(session: BotSession, results: Dict[str, Optional[bool]],
@@ -899,25 +1034,72 @@ class BotStatsManager:
             status = "[SKIP]" if outcome is None else ("[OK]" if outcome else "[FAIL]")
             logger.info(LogArea.API, f"[{session.label}]   {status} {platform}{suffix}")
 
+    @staticmethod
+    def _record_delivery(record: BotCycleRecord, step_name: str,
+                         outcome: Optional[bool], reason: Optional[str]) -> None:
+        step = record.step(step_name)
+        if outcome is True:
+            step.ok('sent')
+        elif outcome is False:
+            step.failed('the post was rejected; the log line carries the status')
+        else:
+            step.skipped(reason)
+
     async def update_bot_stats(self, session: BotSession):
         """Run one full update cycle for a single bot"""
+        record = BotCycleRecord.begin(self.cycle_number)
+        try:
+            await self._run_bot_cycle(session, record)
+        except asyncio.CancelledError:
+            record.outcome = 'cancelled'
+            raise
+        except Exception as e:
+            record.crash(e)
+            raise  # update_all_bots_stats still logs this CRITICAL
+        finally:
+            record.finish()
+            session.stats.commit(record, self.history_size)
+
+    async def _run_bot_cycle(self, session: BotSession, record: BotCycleRecord):
         if not await session.ensure_login(self.http, self.policy, self.gate):
+            record.stop('login', session.dead_reason or 'login failed')
             return
+        record.step('login').ok()
 
         try:
-            guild_count, member_count = await self._count_guilds(session)
+            guild_count, member_count, pages, truncated = await self._count_guilds(session)
         except TRANSIENT_ERRORS as e:
             _alert_failure(self.gate, LogArea.API, f"{session.label}/guild count",
                            f"[{session.label}] guild count failed ({type(e).__name__}: {e}); "
                            f"skipping this cycle rather than posting a partial count")
             await self._reauth_if_unauthorized(session, e)
+            record.stop('guild_count', f"{type(e).__name__}: {e}")
             return
         self.gate.recovered(f"{session.label}/guild count")
+        record.measured_at = datetime.now(timezone.utc)
+        record.server_count = guild_count
+        record.member_count = member_count
+        record.guild_pages_walked = pages
+        record.server_count_truncated = truncated
+        record.step('guild_count').ok()
 
-        shard_count = await self._resolve_shard_count(session)
-        install_count = await self._fetch_install_count(session)
+        shard_count, shard_source, shard_ignored = await self._resolve_shard_count(session)
+        record.shard_count = shard_count
+        record.shard_count_source = shard_source
+        record.shard_count_config_ignored = shard_ignored
+        record.step('shard_count').ok()
 
-        await self._update_server_count_channel(session, {
+        install_count, install_status = await self._fetch_install_count(session)
+        record.user_install_count = install_count
+        record.user_install_status = install_status
+        if install_status == 'error':
+            record.step('user_installs').failed('could not read the install count')
+        elif install_status == 'unavailable':
+            record.step('user_installs').skipped('no_data')
+        else:
+            record.step('user_installs').ok()
+
+        record.apply_channel(await self._update_server_count_channel(session, {
             'server_count': guild_count,
             'count': guild_count,
             'shard_count': shard_count,
@@ -925,10 +1107,13 @@ class BotStatsManager:
             'user_install_count': install_count or 0,
             'bot_name': session.label,
             'bot_id': session.bot_id or '',
-        })
+        }))
 
         report_servers = session.config.get('report_server_count', True)
         report_installs = session.config.get('report_user_installs', True)
+        has_topgg = bool(session.config.get('topgg_token'))
+        has_dbl = bool(session.config.get('dbl_token'))
+        sends_installs = bool(report_installs) and install_count is not None
 
         results = await session.updater.update_all(
             server_count=guild_count if report_servers else None,
@@ -939,6 +1124,23 @@ class BotStatsManager:
         )
         self._log_results(session, results)
 
+        # top.gg PATCHes, so an omitted metric keeps its old value there.
+        server_fields = ['server_count', 'shard_count']
+        topgg = record.step('topgg_stats')
+        topgg.fields_sent = ([] if not report_servers else list(server_fields)) + (
+            ['user_install_count'] if sends_installs else [])
+        topgg.fields_omitted = (list(server_fields) if not report_servers else []) + (
+            [] if sends_installs else ['user_install_count'])
+
+        self._record_delivery(record, 'topgg_stats', results['topgg'],
+                              None if has_topgg else 'no_token')
+        if results['topgg'] is None and has_topgg:
+            topgg.reason = 'all_metrics_disabled'
+        self._record_delivery(record, 'dbl_stats', results['dbl'],
+                              None if has_dbl else 'no_token')
+        if results['dbl'] is None and has_dbl:
+            record.step('dbl_stats').reason = 'report_server_count'
+
         try:
             commands = await self._retrying(
                 session, "fetching slash commands",
@@ -948,35 +1150,87 @@ class BotStatsManager:
                            f"[{session.label}] fetching slash commands failed "
                            f"({type(e).__name__}: {e})")
             await self._reauth_if_unauthorized(session, e)
+            record.stop('slash_commands', f"{type(e).__name__}: {e}")
             return
         self.gate.recovered(f"{session.label}/slash commands")
+        record.step('slash_commands').ok()
+        record.command_count = len(commands)
 
-        command_results = await session.updater.sync_all_commands(commands)
+        command_results, flattened = await session.updater.sync_all_commands(commands)
+        record.command_count_flattened = flattened
         self._log_results(session, command_results, suffix=" (commands)")
+        self._record_delivery(record, 'topgg_commands', command_results['topgg'],
+                              None if has_topgg else 'no_token')
+        self._record_delivery(record, 'dbl_commands', command_results['dbl'],
+                              None if has_dbl else 'no_token')
 
     async def update_all_bots_stats(self):
+        # max_instances covers scheduled ticks; POST /refresh bypasses the
+        # scheduler entirely.
+        if self.cycle_running:
+            logger.warning(LogArea.SCHEDULER,
+                           "a cycle is already running, skipping this trigger")
+            return
+        self.cycle_running = True
+        self.cycle_number += 1
+        self.cycle_started_at = datetime.now(timezone.utc)
+        began = asyncio.get_running_loop().time()
+
         logger.spacer()
         logger.info(LogArea.SCHEDULER, "Starting scheduled stats update")
         logger.spacer()
 
-        self.policy.begin_cycle()
-        outcomes = await asyncio.gather(
-            *(self.update_bot_stats(session) for session in self.sessions),
-            return_exceptions=True,
-        )
-        for session, outcome in zip(self.sessions, outcomes):
-            if isinstance(outcome, asyncio.CancelledError):
-                continue
-            if isinstance(outcome, BaseException):
-                logger.critical(LogArea.SCHEDULER,
-                                f"[{session.label}] update cycle crashed: "
-                                f"{type(outcome).__name__}: {outcome}")
+        try:
+            self.policy.begin_cycle()
+            outcomes = await asyncio.gather(
+                *(self.update_bot_stats(session) for session in self.sessions),
+                return_exceptions=True,
+            )
+            for session, outcome in zip(self.sessions, outcomes):
+                if isinstance(outcome, asyncio.CancelledError):
+                    continue
+                if isinstance(outcome, BaseException):
+                    logger.critical(LogArea.SCHEDULER,
+                                    f"[{session.label}] update cycle crashed: "
+                                    f"{type(outcome).__name__}: {outcome}")
 
-        self._write_heartbeat()
+            self._write_heartbeat()
+            self.cycles_completed += 1
+        finally:
+            self.cycle_running = False
+            self.last_cycle_number = self.cycle_number
+            # So a running cycle cannot lend its start time to this one.
+            self.last_cycle_started_at = self.cycle_started_at
+            self.cycle_finished_at = datetime.now(timezone.utc)
+            self.cycle_duration = asyncio.get_running_loop().time() - began
 
         logger.spacer()
         logger.info(LogArea.SCHEDULER, "Stats update completed")
         logger.spacer()
+
+    def request_refresh(self) -> Tuple[bool, int]:
+        """
+        Run a cycle now, leaving the schedule alone.
+
+        Not scheduler.modify_job: that shifts the whole interval forward, and
+        max_instances would swallow the run anyway.
+        """
+        # create_task only schedules it, so cycle_running is still false here;
+        # without this a double POST starts two cycles.
+        pending = self._refresh_task is not None and not self._refresh_task.done()
+        if self.cycle_running or pending:
+            return False, self.cycle_number
+        logger.info(LogArea.STATS_API, "manual refresh requested over the API")
+        self._refresh_task = asyncio.create_task(self.update_all_bots_stats())
+        self._refresh_task.add_done_callback(self._refresh_done)
+        return True, self.cycle_number + 1
+
+    @staticmethod
+    def _refresh_done(task: asyncio.Task) -> None:
+        # Nothing awaits this task, so its exception has to be retrieved here.
+        if not task.cancelled() and task.exception() is not None:
+            logger.critical(LogArea.STATS_API,
+                            f"manual refresh crashed: {task.exception()!r}")
 
     async def start(self):
         """Log in all bots and start the scheduler"""
@@ -1000,6 +1254,13 @@ class BotStatsManager:
                             f"No bots configured in {self.config_path} -- "
                             f"add at least one entry to \"bots\"")
             sys.exit(1)
+
+        if self.api_enabled:
+            # Before the first cycle, which can take minutes.
+            self.api = StatsAPI(self, self.api_host, self.api_port,
+                                self.api_token, self.api_allow_refresh,
+                                self.api_detailed)
+            await self.api.start()
 
         # A separate login gather here would spend the retry budget twice over for
         # a transiently unreachable bot; the cycle logs them in itself.
@@ -1031,10 +1292,23 @@ class BotStatsManager:
 
     async def stop(self):
         """Stop the scheduler and release every client"""
+        if self.api is not None:
+            await self.api.stop()
+
         logger.info(LogArea.SHUTDOWN, "Stopping scheduler...")
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
         self.policy.abort()
+
+        # Runs outside the scheduler, so nothing else stops it using self.http
+        # and the clients closed just below.
+        refresh, self._refresh_task = self._refresh_task, None
+        if refresh is not None and not refresh.done():
+            refresh.cancel()
+            # CancelledError is a BaseException, so Exception alone lets the
+            # cancellation escape.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await refresh
 
         for session in self.sessions:
             try:

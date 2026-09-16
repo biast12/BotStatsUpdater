@@ -21,6 +21,7 @@ class LogArea(str, Enum):
     API       = 'API'
     SCHEDULER = 'SCHEDULER'
     CHANNEL   = 'CHANNEL'
+    STATS_API = 'STATS_API'
     NONE      = 'NONE'
 
 

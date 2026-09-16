@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.json:/app/config.json:ro
+    # Stats API; the 127.0.0.1: prefix is what keeps it off the network.
+    ports:
+      - "127.0.0.1:8080:8080"
     healthcheck:
       # The app stamps /app/heartbeat with the deadline the next cycle must beat.
       test: ["CMD", "python", "-c", "import sys,time; sys.exit(0 if time.time() < float(open('/app/heartbeat').read()) else 1)"]

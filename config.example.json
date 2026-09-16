@@ -5,6 +5,14 @@
   "alert_webhook_url": "",
   "alert_after_failures": 1,
   "heartbeat_file": "heartbeat",
+  "api": {
+    "enabled": false,
+    "port": 8080,
+    "token": "",
+    "history_size": 48,
+    "detailed": false,
+    "allow_refresh": false
+  },
   "bots": [
     {
       "bot_token": "",

@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source (config.json is mounted at runtime, not baked in)
-COPY main.py logger.py ./
+COPY main.py logger.py api.py ./
 
 # Unbuffered so logs reach `docker logs` immediately
 ENV PYTHONUNBUFFERED=1

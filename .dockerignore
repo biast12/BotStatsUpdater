@@ -9,5 +9,6 @@ ENV/
 .vscode/
 .idea/
 README.md
+images/
 config.example.json
 heartbeat

@@ -1,4 +1,9 @@
-# Bot Stats Updater
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="images/logo-dark.jpg">
+    <img alt="BotStatsUpdater" src="images/logo-light.jpg" width="600">
+  </picture>
+</p>
 
 Automatically update your Discord bot statistics on top.gg and discordbotlist.com. Run as many bots as you like from a single config file.
 

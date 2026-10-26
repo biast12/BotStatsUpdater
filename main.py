@@ -57,6 +57,9 @@ MAX_INTERVAL_MINUTES = 10080.0
 DEFAULT_ALERT_AFTER_FAILURES = 1
 MAX_ALERT_AFTER_FAILURES = 50
 ALERT_MAX_PENDING = 500
+# Every alert posts under this name and avatar, whatever the webhook itself is set to.
+ALERT_USERNAME = "BotStatsUpdater"
+ALERT_AVATAR_URL = "https://raw.githubusercontent.com/biast12/BotStatsUpdater/main/images/icon.jpg"
 
 TRANSIENT_ERRORS = (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError, OSError)
 
@@ -322,10 +325,12 @@ class AlertDispatcher:
                 self._requeue(tail)
 
             body = "\n".join(packed)
+            payload = {"content": f"```\n{body}\n```",
+                       "username": ALERT_USERNAME,
+                       "avatar_url": ALERT_AVATAR_URL}
             settled = False
             try:
-                async with self.session.post(self.webhook_url,
-                                             json={"content": f"```\n{body}\n```"}) as response:
+                async with self.session.post(self.webhook_url, json=payload) as response:
                     if response.status >= 400:
                         self._report(f"HTTP {response.status}")
                 settled = True

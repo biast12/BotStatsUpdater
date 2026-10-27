@@ -34,12 +34,12 @@ A prebuilt image for amd64 and arm64 is published to `ghcr.io/biast12/botstatsup
 
 ### Commands
 
-| Command | What it does |
-|---|---|
-| `docker compose up -d` | Start |
-| `docker compose up -d --pull always` | Update to the newest image |
-| `docker compose restart` | Apply `config.json` changes |
-| `docker compose down` | Stop |
+| Command                              | What it does                |
+| ------------------------------------ | --------------------------- |
+| `docker compose up -d`               | Start                       |
+| `docker compose up -d --pull always` | Update to the newest image  |
+| `docker compose restart`             | Apply `config.json` changes |
+| `docker compose down`                | Stop                        |
 
 ### Image
 
@@ -83,27 +83,27 @@ The config is read once at startup, so restart the bot after editing it.
 
 ### Per-bot options
 
-| Key | Required | Description |
-|-----|----------|-------------|
-| `bot_token` | Yes | Discord bot token |
-| `name` | No | Overrides the name shown in logs and in `{bot_name}`. Defaults to the bot's Discord username. |
-| `topgg_token` | No | Top.gg API token. Leave it out to skip top.gg for this bot. |
-| `dbl_token` | No | DiscordBotList.com API token. Leave it out to skip discordbotlist.com for this bot. |
-| `shard_count` | No | Number of shards this bot actually runs. Omit to report Discord's recommended count. |
-| `report_server_count` | No | `false` stops reporting servers/shards, so discordbotlist.com's stats post is skipped too (its command sync still runs). Use it for a user-install-only app (default: `true`). |
-| `report_user_installs` | No | `false` stops reporting user-app installs to top.gg (default: `true`). |
-| `server_count_channel_id` | No | ID of a voice/text channel to rename with the server count |
-| `server_count_channel_format` | No | Custom format for the channel name (see below) |
+| Key                           | Required | Description                                                                                                                                                                    |
+| ----------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `bot_token`                   | Yes      | Discord bot token                                                                                                                                                              |
+| `name`                        | No       | Overrides the name shown in logs and in `{bot_name}`. Defaults to the bot's Discord username.                                                                                  |
+| `topgg_token`                 | No       | Top.gg API token. Leave it out to skip top.gg for this bot.                                                                                                                    |
+| `dbl_token`                   | No       | DiscordBotList.com API token. Leave it out to skip discordbotlist.com for this bot.                                                                                            |
+| `shard_count`                 | No       | Number of shards this bot actually runs. Omit to report Discord's recommended count.                                                                                           |
+| `report_server_count`         | No       | `false` stops reporting servers/shards, so discordbotlist.com's stats post is skipped too (its command sync still runs). Use it for a user-install-only app (default: `true`). |
+| `report_user_installs`        | No       | `false` stops reporting user-app installs to top.gg (default: `true`).                                                                                                         |
+| `server_count_channel_id`     | No       | ID of a voice/text channel to rename with the server count                                                                                                                     |
+| `server_count_channel_format` | No       | Custom format for the channel name (see below)                                                                                                                                 |
 
 ### Which metrics get reported
 
 Both metrics are independent, so a bot only needs to report what it actually has. top.gg's metrics route is a `PATCH`, meaning a metric you switch off is *left at its previous value* rather than zeroed.
 
-| Bot type | Config |
-|---|---|
-| Normal guild bot | nothing — both default to `true` |
-| User-install-only app | `"report_server_count": false` |
-| Guild bot, no user-app | `"report_user_installs": false` |
+| Bot type               | Config                           |
+| ---------------------- | -------------------------------- |
+| Normal guild bot       | nothing — both default to `true` |
+| User-install-only app  | `"report_server_count": false`   |
+| Guild bot, no user-app | `"report_user_installs": false`  |
 
 Switching both off leaves nothing to send, which is logged and skipped. The server count channel is renamed either way — these options only control what gets sent to the listings.
 
@@ -115,24 +115,24 @@ Each update also pushes the bot's global slash commands to both listings, so the
 
 Anything that talks to Discord or a listing site is tried up to `max_attempts` times, waiting `attempt_delay_seconds` between attempts.
 
-| Step | Retried | When it gives up |
-|---|---|---|
-| Discord login | Yes | The bot is skipped this cycle and tried again on the next one |
-| Server count | Yes — the failing page is re-fetched and the walk resumes where it stopped | The whole bot is skipped; a count short because of a *failure* is never posted. A bot in more than ~100,000 servers hits the 500-page walk cap, which logs a warning and does post the short count. |
-| Slash command fetch | Yes | Commands are not synced this cycle; the stats posted above still count |
-| Posts to top.gg / discordbotlist.com | Yes | That post is logged `[FAIL]` |
-| Server count channel rename | No | The rename is skipped and retried next cycle |
-| Shard count | No | Falls back to `1` |
-| User install count | No | Left out of the payload, so the listing keeps its previous figure |
+| Step                                 | Retried                                                                    | When it gives up                                                                                                                                                                                    |
+| ------------------------------------ | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Discord login                        | Yes                                                                        | The bot is skipped this cycle and tried again on the next one                                                                                                                                       |
+| Server count                         | Yes — the failing page is re-fetched and the walk resumes where it stopped | The whole bot is skipped; a count short because of a *failure* is never posted. A bot in more than ~100,000 servers hits the 500-page walk cap, which logs a warning and does post the short count. |
+| Slash command fetch                  | Yes                                                                        | Commands are not synced this cycle; the stats posted above still count                                                                                                                              |
+| Posts to top.gg / discordbotlist.com | Yes                                                                        | That post is logged `[FAIL]`                                                                                                                                                                        |
+| Server count channel rename          | No                                                                         | The rename is skipped and retried next cycle                                                                                                                                                        |
+| Shard count                          | No                                                                         | Falls back to `1`                                                                                                                                                                                   |
+| User install count                   | No                                                                         | Left out of the payload, so the listing keeps its previous figure                                                                                                                                   |
 
 Some failures will never succeed on a second try, so they are not retried at all:
 
-| Condition | Why |
-|---|---|
-| `401` / `403` from a listing | The token is wrong — logged `CRITICAL`, so it reaches your alert webhook |
-| Any other `4xx` that is not `429` | The request itself is wrong |
+| Condition                              | Why                                                                               |
+| -------------------------------------- | --------------------------------------------------------------------------------- |
+| `401` / `403` from a listing           | The token is wrong — logged `CRITICAL`, so it reaches your alert webhook          |
+| Any other `4xx` that is not `429`      | The request itself is wrong                                                       |
 | Discord rejects the bot token at login | The bot is disabled for the rest of the run, so a revoked token costs no requests |
-| `bot_token` missing | Config error |
+| `bot_token` missing                    | Config error                                                                      |
 
 If Discord rejects an *already logged-in* bot with a `401` — which is what resetting the token in the developer portal looks like — the session is dropped and the bot logs in again on the next cycle.
 
@@ -150,11 +150,11 @@ Two separate things decide how much lands in your webhook, and they work at diff
 
 **Across cycles** is what `alert_after_failures` controls. A platform that stays down fails once per cycle, every cycle, so at the default of `1` an overnight top.gg outage fills your webhook. Raise it and a step has to fail that many cycles in a row before it says anything:
 
-| `alert_after_failures` | What reaches the webhook |
-|---|---|
-| `1` (default) | Every failed cycle, immediately |
-| `2` | Nothing until it has failed twice running — a single bad cycle stays silent |
-| `3` | Nothing until the third consecutive failure |
+| `alert_after_failures` | What reaches the webhook                                                    |
+| ---------------------- | --------------------------------------------------------------------------- |
+| `1` (default)          | Every failed cycle, immediately                                             |
+| `2`                    | Nothing until it has failed twice running — a single bad cycle stays silent |
+| `3`                    | Nothing until the third consecutive failure                                 |
 
 At `update_interval_minutes: 30`, setting `3` means roughly "don't tell me unless it has been broken for an hour and a half".
 
@@ -179,25 +179,25 @@ When `server_count_channel_id` is set, the bot will rename that channel on every
 
 **Format string rules (`server_count_channel_format`):**
 
-| Config value | Result |
-|---|---|
-| *(omitted)* | `BotName: 2553` |
-| `"Servers: {count}"` | `Servers: 2553` |
-| `"Servers: {server_count:,}"` | `Servers: 2,553` |
-| `"{bot_name}: {member_count:,} users"` | `PurgeBot: 655,270 users` |
+| Config value                                                                   | Result                                                               |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| *(omitted)*                                                                    | `BotName: 2553`                                                      |
+| `"Servers: {count}"`                                                           | `Servers: 2553`                                                      |
+| `"Servers: {server_count:,}"`                                                  | `Servers: 2,553`                                                     |
+| `"{bot_name}: {member_count:,} users"`                                         | `PurgeBot: 655,270 users`                                            |
 | `"Servers: {server_count:,}{if shard_count > 1} │ Shards: {shard_count}{end}"` | `Servers: 2,553 │ Shards: 3`, or `Servers: 493` for an unsharded bot |
 
 **Available placeholders:**
 
-| Placeholder | Value |
-|---|---|
-| `{server_count}` | Servers the bot is in |
-| `{count}` | Alias of `{server_count}` |
-| `{shard_count}` | The same number reported to top.gg (see `shard_count` above) |
-| `{member_count}` | Total members across all servers — Discord's approximate counts, summed, the same figure sent to discordbotlist.com |
-| `{bot_name}` | The bot's name, from `name` or auto-detected from the token |
-| `{user_install_count}` | User-app installs |
-| `{bot_id}` | The bot's user ID |
+| Placeholder            | Value                                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `{server_count}`       | Servers the bot is in                                                                                               |
+| `{count}`              | Alias of `{server_count}`                                                                                           |
+| `{shard_count}`        | The same number reported to top.gg (see `shard_count` above)                                                        |
+| `{member_count}`       | Total members across all servers — Discord's approximate counts, summed, the same figure sent to discordbotlist.com |
+| `{bot_name}`           | The bot's name, from `name` or auto-detected from the token                                                         |
+| `{user_install_count}` | User-app installs                                                                                                   |
+| `{bot_id}`             | The bot's user ID                                                                                                   |
 
 Add `:,` inside any numeric placeholder for thousands separators: `{member_count:,}` → `655,270`.
 
@@ -268,25 +268,25 @@ A bot's `updated_at` is when its figures were measured. One that fails before co
 
 ### Options
 
-| Key | Default | |
-|---|---|---|
-| `enabled` | `false` | Must be a real `true`, not `"true"`. |
-| `host` | *(automatic)* | `127.0.0.1`, or `0.0.0.0` in a container. Leave it out — see [Docker](#docker). |
-| `port` | `8080` | |
-| `token` | `""` | Set it and every request needs `Authorization: Bearer <token>`. |
-| `detailed` | `false` | Adds the operational fields, see below. |
-| `history_size` | `48` | Cycles kept per bot, in memory. `0` turns history off. |
-| `allow_refresh` | `false` | Enables `POST /refresh`. |
+| Key             | Default       |                                                                                 |
+| --------------- | ------------- | ------------------------------------------------------------------------------- |
+| `enabled`       | `false`       | Must be a real `true`, not `"true"`.                                            |
+| `host`          | *(automatic)* | `127.0.0.1`, or `0.0.0.0` in a container. Leave it out — see [Docker](#docker). |
+| `port`          | `8080`        |                                                                                 |
+| `token`         | `""`          | Set it and every request needs `Authorization: Bearer <token>`.                 |
+| `detailed`      | `false`       | Adds the operational fields, see below.                                         |
+| `history_size`  | `48`          | Cycles kept per bot, in memory. `0` turns history off.                          |
+| `allow_refresh` | `false`       | Enables `POST /refresh`.                                                        |
 
 ### Endpoints
 
-| Method | Path | |
-|---|---|---|
-| `GET` | `/` | Totals and every bot |
-| `GET` | `/<bot>` | One bot |
-| `GET` | `/<bot>/history` | That bot's recent cycles |
-| `GET` | `/health` | `{"status": "..."}` and a status code to alert on |
-| `POST` | `/refresh` | Run a cycle now — `202`, or `409` if one is already running. Does not move the schedule. |
+| Method | Path             |                                                                                          |
+| ------ | ---------------- | ---------------------------------------------------------------------------------------- |
+| `GET`  | `/`              | Totals and every bot                                                                     |
+| `GET`  | `/<bot>`         | One bot                                                                                  |
+| `GET`  | `/<bot>/history` | That bot's recent cycles                                                                 |
+| `GET`  | `/health`        | `{"status": "..."}` and a status code to alert on                                        |
+| `POST` | `/refresh`       | Run a cycle now — `202`, or `409` if one is already running. Does not move the schedule. |
 
 `<bot>` is the Discord ID or the ref `bot-1`, `bot-2`, … as they appear in `bots`. The ref is the only handle a bot with a bad token has, since it never logs in. Names are not accepted: two bots can share one, and renaming a bot would change its address.
 
@@ -304,12 +304,12 @@ No token or webhook URL appears in either mode, and error text is scrubbed befor
 
 ### Health
 
-| Status | HTTP | |
-|---|---|---|
-| `starting` | 200 | No cycle has finished yet |
-| `ok` | 200 | Every check passed |
-| `degraded` | 200 | Something is failing, but the app works |
-| `down` | 503 | Cycles have stopped, or a bot is disabled by a bad token |
+| Status     | HTTP |                                                          |
+| ---------- | ---- | -------------------------------------------------------- |
+| `starting` | 200  | No cycle has finished yet                                |
+| `ok`       | 200  | Every check passed                                       |
+| `degraded` | 200  | Something is failing, but the app works                  |
+| `down`     | 503  | Cycles have stopped, or a bot is disabled by a bad token |
 
 A failing listing post is `degraded`, never `down` — an outage at top.gg should not restart your container. Staleness uses the heartbeat's own deadline, so `/health` and `docker ps` cannot disagree; the Docker healthcheck stays on the file, which keeps working when the API is off.
 

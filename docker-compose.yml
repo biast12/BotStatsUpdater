@@ -1,10 +1,16 @@
 services:
   bot-stats-updater:
-    build: .
+    image: ${BOT_STATS_UPDATER_IMAGE:-ghcr.io/biast12/botstatsupdater:latest}
     container_name: bot-stats-updater
     restart: unless-stopped
     volumes:
-      - ./config.json:/app/config.json:ro
+      # Long form: on Linux a missing config.json fails instead of becoming a folder.
+      - type: bind
+        source: ./config.json
+        target: /app/config.json
+        read_only: true
+        bind:
+          create_host_path: false
     # Stats API; the 127.0.0.1: prefix is what keeps it off the network.
     ports:
       - "127.0.0.1:8080:8080"

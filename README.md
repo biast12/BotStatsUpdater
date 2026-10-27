@@ -18,50 +18,46 @@ It talks to Discord over REST only and never connects to the gateway, so it need
 - Optional Discord webhook alerts when something goes wrong
 - Optional read-only stats API on a localhost port
 - Configurable retries on logins, counts and listing posts
-- Docker support with a healthcheck
+- Prebuilt Docker image (amd64 and arm64) with a healthcheck
 
 ## Installation
 
-1. Install dependencies:
+A prebuilt image for amd64 and arm64 is published to `ghcr.io/biast12/botstatsupdater`.
 
-   ```bash
-   pip install -r requirements.txt
-   ```
-
+1. Clone the repo, or download [`docker-compose.yml`](docker-compose.yml) and [`config.example.json`](config.example.json).
 2. Copy `config.example.json` to `config.json` and fill in your tokens.
-
-3. Run it:
-
-   ```bash
-   python main.py
-   ```
-
-   On Windows you can double-click `start.bat` instead.
+3. Run `docker compose up -d`.
 
 **Note:** Bot ID and name are automatically detected from the Discord token.
 
-### Docker
-
-With `config.json` in place, start the container:
-
-```bash
-docker compose up -d --build
-```
-
 `config.json` is mounted into the container rather than baked into the image, so your tokens stay out of the image.
 
-Two helper scripts are included for everyday use:
+### Commands
 
-| Script | What it does |
+| Command | What it does |
 |---|---|
-| `rebuild.sh` / `rebuild.bat` | Rebuilds the image and recreates the container — use after changing the code |
-| `reload.sh` / `reload.bat` | Recreates the container without rebuilding — use after changing `config.json` |
+| `docker compose up -d` | Start |
+| `docker compose up -d --pull always` | Update to the newest image |
+| `docker compose restart` | Apply `config.json` changes |
+| `docker compose down` | Stop |
+
+### Image
+
+Set `BOT_STATS_UPDATER_IMAGE`, e.g. in `.env`, to run something other than `ghcr.io/biast12/botstatsupdater:latest`:
+
+```
+BOT_STATS_UPDATER_IMAGE=ghcr.io/biast12/botstatsupdater:sha-abc1234
+```
+
+Tags: `latest` (newest `main`), `1.2.3` / `1.2` / `1` (releases), `sha-abc1234` (one commit), all listed on the [package page](https://github.com/users/biast12/packages/container/package/botstatsupdater).
+
+### Local development
+
+`build-local.sh` / `build-local.bat` build `bot-stats-updater-local` from your checkout and run it with `BOT_STATS_UPDATER_IMAGE=bot-stats-updater-local`.
 
 ### Healthcheck
 
 Each completed cycle stamps `heartbeat` with the time by which the *next* cycle must finish (two intervals plus five minutes). `docker-compose.yml` reads it, so `docker ps` shows the container as unhealthy if cycles stop running.
-
-The file is created at runtime and is not part of the repository.
 
 ## Getting API Tokens
 
@@ -82,7 +78,7 @@ The config is read once at startup, so restart the bot after editing it.
 - `attempt_delay_seconds`: Seconds to wait between attempts (default: `2`, maximum `60`). This is a *floor*: every retry waits this plus up to 25% jitter, and when a platform answers `429` with a `Retry-After`, the longer of the two is used.
 - `alert_webhook_url`: Discord webhook that receives `ERROR` and `CRITICAL` log lines, batched every 10s (default: none). Without it, a revoked token only shows up in `docker logs`.
 - `alert_after_failures`: How many times in a row something must fail before it reaches the webhook (default: `1`, meaning alert straight away). `2` stays quiet about a one-off blip and only tells you once it has failed twice running. A success resets the count. See [Alert volume](#alert-volume).
-- `heartbeat_file`: File stamped after each cycle, read by the Docker healthcheck (default: `heartbeat`). Set to `""` to disable.
+- `heartbeat_file`: File stamped after each cycle, read by the Docker healthcheck (default: `heartbeat`). Keep the default; the healthcheck reads `/app/heartbeat`.
 - `api`: Read-only HTTP stats API, off by default. See [Stats API](#stats-api).
 
 ### Per-bot options
@@ -275,7 +271,7 @@ A bot's `updated_at` is when its figures were measured. One that fails before co
 | Key | Default | |
 |---|---|---|
 | `enabled` | `false` | Must be a real `true`, not `"true"`. |
-| `host` | *(automatic)* | `127.0.0.1`, or `0.0.0.0` in a container. Leave it out — see [Docker](#docker-1). |
+| `host` | *(automatic)* | `127.0.0.1`, or `0.0.0.0` in a container. Leave it out — see [Docker](#docker). |
 | `port` | `8080` | |
 | `token` | `""` | Set it and every request needs `Authorization: Bearer <token>`. |
 | `detailed` | `false` | Adds the operational fields, see below. |
@@ -319,7 +315,7 @@ A failing listing post is `degraded`, never `down` — an outage at top.gg shoul
 
 ### Docker
 
-Omit `host` — it binds `0.0.0.0` inside the container on its own. Add the published port:
+Omit `host` — it binds `0.0.0.0` inside the container on its own. `docker-compose.yml` already publishes the port on loopback:
 
 ```yaml
 ports:

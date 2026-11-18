@@ -15,13 +15,14 @@ import math
 import random
 import asyncio
 import contextlib
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple, Deque, Callable, Awaitable
+from typing import Optional, Dict, Any, List, Tuple, Callable, Awaitable
 
 import aiohttp
 import discord
+import sentry_sdk
+from sentry_sdk.transport import HttpTransport
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -32,8 +33,6 @@ from api import (BotCycleRecord, BotStats, ChannelOutcome, StatsAPI, redact,
 logger = BotLogger.get_instance()
 
 REQUEST_TIMEOUT_SECONDS = 15
-ALERT_FLUSH_SECONDS = 10
-ALERT_MAX_CHARS = 1800
 HEARTBEAT_GRACE_SECONDS = 300
 GUILD_PAGE_SIZE = 200
 GUILD_PAGE_LIMIT = 500
@@ -56,10 +55,6 @@ MAX_INTERVAL_MINUTES = 10080.0
 
 DEFAULT_ALERT_AFTER_FAILURES = 1
 MAX_ALERT_AFTER_FAILURES = 50
-ALERT_MAX_PENDING = 500
-# Every alert posts under this name and avatar, whatever the webhook itself is set to.
-ALERT_USERNAME = "BotStatsUpdater"
-ALERT_AVATAR_URL = "https://raw.githubusercontent.com/biast12/BotStatsUpdater/main/images/icon.jpg"
 
 TRANSIENT_ERRORS = (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError, OSError)
 
@@ -235,7 +230,7 @@ class RetryPolicy:
 
 @dataclass
 class AlertGate:
-    """Holds a failure back from the webhook until it repeats `threshold` times."""
+    """Holds a failure back from error reporting until it repeats `threshold` times."""
     threshold: int = DEFAULT_ALERT_AFTER_FAILURES
     streaks: Dict[str, int] = field(default_factory=dict)
 
@@ -248,125 +243,43 @@ class AlertGate:
         self.streaks.pop(key, None)
 
 
-def _alert_failure(gate: AlertGate, area: LogArea, key: str, message: str) -> None:
+def _alert_failure(gate: AlertGate, area: LogArea, key: str, message: str,
+                   exc: Optional[BaseException] = None) -> None:
     # Below the threshold this logs WARNING, which the sink does not forward.
     count = gate.failed(key)
     if count >= gate.threshold:
-        logger.error(area, message)
+        logger.error(area, message, exc)
     else:
         logger.warning(area, f"{message} (failure {count} of {gate.threshold} "
                              f"before alerting)")
 
 
-class AlertDispatcher:
-    """Batches the log lines the sink feeds it and posts them to a Discord webhook."""
+def _scrub(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact(value, limit=None)
+    if isinstance(value, dict):
+        return {key: _scrub(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub(item) for item in value]
+    return value
 
-    def __init__(self, webhook_url: str, session: aiohttp.ClientSession):
-        self.webhook_url = webhook_url
-        self.session = session
-        self._pending: Deque[str] = deque(maxlen=ALERT_MAX_PENDING)
-        self._overflowed = 0
-        self._lock = asyncio.Lock()
-        self._task: Optional[asyncio.Task] = None
 
-    def collect(self, level: LogLevel, area: LogArea, message: str) -> None:
-        if len(self._pending) == ALERT_MAX_PENDING:
-            self._overflowed += 1
-        self._pending.append(f"[{level.value}] [{area.value}] {message}")
+def _report(level: LogLevel, area: LogArea, message: str,
+            exc: Optional[BaseException]) -> None:
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag('area', area.value)
+        scope.set_level('fatal' if level is LogLevel.CRITICAL else 'error')
+        if exc is None:
+            sentry_sdk.capture_message(message)
+        else:
+            scope.set_context('log', {'message': message})
+            sentry_sdk.capture_exception(exc)
 
-    def stats(self) -> Dict[str, int]:
-        """Counts only; the buffered lines never leave the process."""
-        return {"pending": len(self._pending), "dropped": self._overflowed}
 
-    def start(self) -> None:
-        self._task = asyncio.create_task(self._run())
-
-    async def stop(self) -> None:
-        # cancel() only schedules it; awaiting stops this racing the task's own flush.
-        task, self._task = self._task, None
-        if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        for _ in range(3):
-            if not self._pending:
-                break
-            try:
-                await self._flush()
-            except Exception as e:
-                self._report(f"flush crashed: {type(e).__name__}: {e}")
-                break
-        if self._pending:
-            self._report(f"{len(self._pending)} alert line(s) dropped at shutdown")
-
-    async def _run(self) -> None:
-        while True:
-            await asyncio.sleep(ALERT_FLUSH_SECONDS)
-            try:
-                await self._flush()
-            except Exception as e:
-                # Without this an unexpected raise kills alerting for the whole run.
-                self._report(f"flush crashed: {type(e).__name__}: {e}")
-
-    async def _flush(self) -> None:
-        if not self._pending:
-            return
-        async with self._lock:
-            if not self._pending:
-                return
-            lines = list(self._pending)
-            self._pending.clear()
-            if self._overflowed:
-                lines.insert(0, f"[!] {self._overflowed} line(s) dropped: alert buffer full")
-                self._overflowed = 0
-
-            packed, tail = self._fit(lines)
-            if tail:
-                self._requeue(tail)
-
-            body = "\n".join(packed)
-            payload = {"content": f"```\n{body}\n```",
-                       "username": ALERT_USERNAME,
-                       "avatar_url": ALERT_AVATAR_URL}
-            settled = False
-            try:
-                async with self.session.post(self.webhook_url, json=payload) as response:
-                    if response.status >= 400:
-                        self._report(f"HTTP {response.status}")
-                settled = True
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                # A rejected POST consumes its batch; re-sending needs its own backoff.
-                self._report(f"{type(e).__name__}: {e}")
-                settled = True
-            finally:
-                # The buffer was emptied before the await, so a cancellation here
-                # would otherwise take the batch with it.
-                if not settled:
-                    self._requeue(packed)
-
-    def _requeue(self, lines: List[str]) -> None:
-        """Put lines back at the front, counting any the cap evicts."""
-        before = len(self._pending)
-        self._pending.extendleft(reversed(lines))
-        self._overflowed += before + len(lines) - len(self._pending)
-
-    @staticmethod
-    def _fit(lines: List[str]) -> Tuple[List[str], List[str]]:
-        """Split into what fits one webhook message and what has to wait for the next."""
-        packed: List[str] = []
-        used = 0
-        for index, line in enumerate(lines):
-            line = line[:ALERT_MAX_CHARS]
-            if packed and used + len(line) + 1 > ALERT_MAX_CHARS:
-                return packed, lines[index:]
-            packed.append(line)
-            used += len(line) + 1
-        return packed, []
-
-    @staticmethod
-    def _report(problem: str) -> None:
-        # print, not logger: logging here would feed straight back into this sink.
-        print(f"alert webhook failed: {problem}", flush=True)
+class _ReportTransport(HttpTransport):
+    def on_dropped_event(self, reason: str) -> None:
+        # print, not logger: an ERROR here would feed straight back into the sink.
+        print(f"error report not delivered: {reason}", flush=True)
 
 
 class BotStatsUpdater:
@@ -521,7 +434,7 @@ class BotStatsUpdater:
         if isinstance(outcome, BaseException):
             _alert_failure(self.gate, LogArea.API, f"{self.label}/{platform}",
                            f"[{self.label}] {platform} raised "
-                           f"{type(outcome).__name__}: {outcome}")
+                           f"{type(outcome).__name__}: {outcome}", outcome)
             return False
         return outcome
 
@@ -705,11 +618,13 @@ class BotStatsManager:
         self._warn_if_retries_outlast_interval()
         self._resolve_api_config()
         self._learn_secrets()
+        if self.config.get('alert_webhook_url'):
+            _config_warn("alert_webhook_url is no longer used; set error_reporting_dsn")
 
         self.sessions: List[BotSession] = []
         self.http: Optional[aiohttp.ClientSession] = None
         self.scheduler = AsyncIOScheduler()
-        self.alerts: Optional[AlertDispatcher] = None
+        self.error_reporting = False
         self.api: Optional[StatsAPI] = None
         self._channel_last_updated: Dict[int, datetime] = {}
 
@@ -760,7 +675,7 @@ class BotStatsManager:
             self.api_host = fallback
 
     def _learn_secrets(self) -> None:
-        redact.learn(self.config.get('alert_webhook_url'))
+        redact.learn(self.config.get('error_reporting_dsn'))
         redact.learn(self.api_token)
         for bot in self.config.get('bots') or []:
             if isinstance(bot, dict):
@@ -1197,7 +1112,7 @@ class BotStatsManager:
                 if isinstance(outcome, BaseException):
                     logger.critical(LogArea.SCHEDULER,
                                     f"[{session.label}] update cycle crashed: "
-                                    f"{type(outcome).__name__}: {outcome}")
+                                    f"{type(outcome).__name__}: {outcome}", outcome)
 
             self._write_heartbeat()
             self.cycles_completed += 1
@@ -1235,7 +1150,7 @@ class BotStatsManager:
         # Nothing awaits this task, so its exception has to be retrieved here.
         if not task.cancelled() and task.exception() is not None:
             logger.critical(LogArea.STATS_API,
-                            f"manual refresh crashed: {task.exception()!r}")
+                            f"manual refresh crashed: {task.exception()!r}", task.exception())
 
     async def start(self):
         """Log in all bots and start the scheduler"""
@@ -1245,12 +1160,33 @@ class BotStatsManager:
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=5),
         )
 
-        webhook_url = self.config.get('alert_webhook_url', '')
-        if webhook_url:
-            self.alerts = AlertDispatcher(webhook_url, self.http)
-            logger.set_sink(self.alerts.collect)
-            self.alerts.start()
-            logger.info(LogArea.STARTUP, "Alerting errors to the configured webhook")
+        dsn = self.config.get('error_reporting_dsn', '')
+        if not isinstance(dsn, str):
+            # Not echoed: config_warnings is served in the detailed payload.
+            _config_warn("error_reporting_dsn is not text, error reporting stays off")
+            dsn = ''
+        dsn = dsn.strip()
+        if dsn:
+            try:
+                sentry_sdk.init(
+                    dsn=dsn,
+                    transport=_ReportTransport,
+                    # A traceback's locals include BotSession, whose repr carries every token.
+                    include_local_variables=False,
+                    # Otherwise discord.py's requests to Discord carry tracing headers.
+                    trace_propagation_targets=[],
+                    # Ctrl+C mid-cycle makes apscheduler log the cancelled job as an ERROR.
+                    ignore_errors=[asyncio.CancelledError],
+                    before_send=lambda event, _hint: _scrub(event),
+                )
+            except Exception as e:
+                logger.error(LogArea.STARTUP,
+                             f"error_reporting_dsn is not a valid DSN ({e}), "
+                             f"continuing without error reporting")
+            else:
+                self.error_reporting = True
+                logger.set_sink(_report)
+                logger.info(LogArea.STARTUP, "Sentry-compatible error reporting enabled")
 
         self.sessions = [BotSession(index=i, config=bot_config)
                          for i, bot_config in enumerate(self.config.get('bots', []))]
@@ -1321,11 +1257,6 @@ class BotStatsManager:
             except Exception as e:
                 logger.warning(LogArea.SHUTDOWN,
                                f"[{session.label}] close failed: {type(e).__name__}: {e}")
-
-        if self.alerts is not None:
-            # Unhook first, or an ERROR logged after the final flush is never drained.
-            logger.set_sink(None)
-            await self.alerts.stop()
 
         if self.http is not None:
             await self.http.close()

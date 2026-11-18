@@ -14,7 +14,6 @@ import os
 import json
 import ipaddress
 import hmac
-import socket
 import asyncio
 import contextlib
 from collections import deque
@@ -141,7 +140,7 @@ class Redactor:
         if isinstance(value, str) and len(value.strip()) >= 8:
             self._literals.append(value.strip())
 
-    def __call__(self, text: Any, limit: int = ERROR_DETAIL_LIMIT) -> Optional[str]:
+    def __call__(self, text: Any, limit: Optional[int] = ERROR_DETAIL_LIMIT) -> Optional[str]:
         if text is None:
             return None
         clean = str(text)
@@ -529,7 +528,6 @@ def _service_payload(manager: 'BotStatsManager') -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     next_run = _next_run(manager)
     deadline = manager.heartbeat_deadline
-    alerts = manager.alerts.stats() if manager.alerts is not None else None
 
     return {
         "started_at": _iso(manager.started_at),
@@ -561,10 +559,8 @@ def _service_payload(manager: 'BotStatsManager') -> Dict[str, Any]:
             "cycle_budget_seconds": _round(manager.policy.cycle_budget),
         },
         "alerting": {
-            "webhook_configured": manager.alerts is not None,
+            "error_reporting_configured": manager.error_reporting,
             "alert_after_failures": manager.gate.threshold,
-            "pending_lines": alerts["pending"] if alerts else None,
-            "dropped_lines": alerts["dropped"] if alerts else None,
         },
         "bots": {
             "logged_in": sum(1 for s in manager.sessions if s.bot_id is not None),
@@ -772,7 +768,7 @@ class StatsAPI:
                     f"Stats API listening on {listen_label(self.host, self.port)} "
                     f"({'token required' if self.auth_required else 'no auth'})")
         if is_loopback(self.host) and in_container():
-            # ERROR so it reaches the webhook: the log claims it is listening
+            # ERROR so it is reported: the log claims it is listening
             # while every request gets an empty reply.
             logger.error(LogArea.CONFIG,
                          f"api.host={self.host} is this container's own loopback, "
@@ -822,7 +818,7 @@ class StatsAPI:
                 {"error": "not_found" if e.status == 404 else "request_failed"},
                 e.status)
         except Exception as e:
-            # WARNING, not ERROR: the logger forwards ERROR to the alert webhook,
+            # WARNING, not ERROR: the logger forwards ERROR to error reporting,
             # so a scrape loop over a broken handler would page you about itself.
             logger.warning(LogArea.STATS_API,
                            f"{request.method} {request.path} failed: "

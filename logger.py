@@ -48,6 +48,8 @@ _COLORS = {
 _RESET  = '\x1b[0m'
 _CYAN   = '\x1b[36m'
 
+Sink = Callable[[LogLevel, LogArea, str, Optional[BaseException]], None]
+
 
 class BotLogger:
     _instance: Optional[BotLogger] = None
@@ -55,7 +57,7 @@ class BotLogger:
     def __init__(self) -> None:
         self._console_enabled: bool = True
         self._min_level: LogLevel = LogLevel.INFO
-        self._sink: Optional[Callable[[LogLevel, LogArea, str], None]] = None
+        self._sink: Optional[Sink] = None
 
     @classmethod
     def get_instance(cls) -> BotLogger:
@@ -85,17 +87,18 @@ class BotLogger:
             f"{color}[{now}] [{padded_level}] [{padded_area}] {message}{_RESET}"
         )
 
-    def set_sink(self, sink: Optional[Callable[[LogLevel, LogArea, str], None]]) -> None:
+    def set_sink(self, sink: Optional[Sink]) -> None:
         """Also hand ERROR and CRITICAL messages to `sink`."""
         self._sink = sink
 
-    def log(self, level: LogLevel, area: LogArea, message: str) -> None:
+    def log(self, level: LogLevel, area: LogArea, message: str,
+            exc: Optional[BaseException] = None) -> None:
         if self._console_enabled and self._should_log(level):
             print(self._format_message(level, area, message), flush=True)
 
         if self._sink is not None and level in _SINK_LEVELS:
             try:
-                self._sink(level, area, message)
+                self._sink(level, area, message, exc)
             except Exception:
                 pass
 
@@ -108,11 +111,13 @@ class BotLogger:
     def warning(self, area: LogArea, message: str) -> None:
         self.log(LogLevel.WARNING, area, message)
 
-    def error(self, area: LogArea, message: str) -> None:
-        self.log(LogLevel.ERROR, area, message)
+    def error(self, area: LogArea, message: str,
+              exc: Optional[BaseException] = None) -> None:
+        self.log(LogLevel.ERROR, area, message, exc)
 
-    def critical(self, area: LogArea, message: str) -> None:
-        self.log(LogLevel.CRITICAL, area, message)
+    def critical(self, area: LogArea, message: str,
+                 exc: Optional[BaseException] = None) -> None:
+        self.log(LogLevel.CRITICAL, area, message, exc)
 
     def print(self, area: LogArea, message: str) -> None:
         self.log(LogLevel.NONE, area, message)

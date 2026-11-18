@@ -2,7 +2,7 @@
   "update_interval_minutes": 30,
   "max_attempts": 2,
   "attempt_delay_seconds": 2,
-  "alert_webhook_url": "",
+  "error_reporting_dsn": "",
   "alert_after_failures": 1,
   "heartbeat_file": "heartbeat",
   "api": {

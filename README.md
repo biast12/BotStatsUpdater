@@ -15,7 +15,7 @@ It talks to Discord over REST only and never connects to the gateway, so it need
 - Server, member, shard and user-install counts posted to top.gg and discordbotlist.com
 - Slash commands synced to both listings
 - Optional channel that gets renamed with your live server count
-- Optional Discord webhook alerts when something goes wrong
+- Optional Sentry-compatible error reporting
 - Optional read-only stats API on a localhost port
 - Configurable retries on logins, counts and listing posts
 - Prebuilt Docker image (amd64 and arm64) with a healthcheck
@@ -76,8 +76,8 @@ The config is read once at startup, so restart the bot after editing it.
 - `update_interval_minutes`: How often to update stats (default: `30`). One update also runs immediately at startup.
 - `max_attempts`: How many times each retryable step is tried before it gives up (default: `2`, maximum `5`). `1` disables retrying. See [Retries](#retries).
 - `attempt_delay_seconds`: Seconds to wait between attempts (default: `2`, maximum `60`). This is a *floor*: every retry waits this plus up to 25% jitter, and when a platform answers `429` with a `Retry-After`, the longer of the two is used.
-- `alert_webhook_url`: Discord webhook that receives `ERROR` and `CRITICAL` log lines, batched every 10s (default: none). Without it, a revoked token only shows up in `docker logs`.
-- `alert_after_failures`: How many times in a row something must fail before it reaches the webhook (default: `1`, meaning alert straight away). `2` stays quiet about a one-off blip and only tells you once it has failed twice running. A success resets the count. See [Alert volume](#alert-volume).
+- `error_reporting_dsn`: DSN for Sentry-compatible error reporting (default: none). Receives `ERROR` and `CRITICAL` log lines, crashes with their traceback, and errors logged by libraries (these skip `alert_after_failures`); known tokens are scrubbed first. Without it, a revoked token only shows up in `docker logs`.
+- `alert_after_failures`: How many times in a row something must fail before it is reported (default: `1`, meaning report straight away). `2` stays quiet about a one-off blip and only tells you once it has failed twice running. A success resets the count. See [Alert volume](#alert-volume).
 - `heartbeat_file`: File stamped after each cycle, read by the Docker healthcheck (default: `heartbeat`). Keep the default; the healthcheck reads `/app/heartbeat`.
 - `api`: Read-only HTTP stats API, off by default. See [Stats API](#stats-api).
 
@@ -129,7 +129,7 @@ Some failures will never succeed on a second try, so they are not retried at all
 
 | Condition                              | Why                                                                               |
 | -------------------------------------- | --------------------------------------------------------------------------------- |
-| `401` / `403` from a listing           | The token is wrong — logged `CRITICAL`, so it reaches your alert webhook          |
+| `401` / `403` from a listing           | The token is wrong, so it is logged `CRITICAL` and reported                       |
 | Any other `4xx` that is not `429`      | The request itself is wrong                                                       |
 | Discord rejects the bot token at login | The bot is disabled for the rest of the run, so a revoked token costs no requests |
 | `bot_token` missing                    | Config error                                                                      |
@@ -140,17 +140,17 @@ If Discord rejects an *already logged-in* bot with a `401` — which is what res
 
 **Retries never delay the schedule.** A cycle stops retrying once it has used 80% of `update_interval_minutes`, so retries can't push a cycle past its next tick and silently skip it. If `max_attempts` and `attempt_delay_seconds` can't fit in that budget, a warning is logged at startup telling you which one to change.
 
-**Retries don't spam your webhook.** Individual attempts are logged at `WARNING`, which is console-only; only the final failure of a step is `ERROR`. Raising `max_attempts` therefore adds no webhook traffic at all. The trade-off is that a call which fails once and then succeeds no longer reaches the webhook — look in `docker logs` for `retrying in` and `succeeded on attempt` to spot a platform that is flapping.
+**Retries don't flood error reporting.** Individual attempts are logged at `WARNING`, which is console-only; only the final failure of a step is `ERROR`. Raising `max_attempts` therefore adds no reports at all. The trade-off is that a call which fails once and then succeeds is never reported. Look in `docker logs` for `retrying in` and `succeeded on attempt` to spot a platform that is flapping.
 
 ## Alert volume
 
-Two separate things decide how much lands in your webhook, and they work at different timescales.
+Two separate things decide how much gets reported, and they work at different timescales.
 
 **Within one cycle**, `max_attempts` costs you nothing. Each attempt logs at `WARNING` (console only) and only the final give-up is `ERROR`, so a step that fails and then succeeds sends nothing at all, and a step that fails outright sends exactly one line whether `max_attempts` is 2 or 5.
 
-**Across cycles** is what `alert_after_failures` controls. A platform that stays down fails once per cycle, every cycle, so at the default of `1` an overnight top.gg outage fills your webhook. Raise it and a step has to fail that many cycles in a row before it says anything:
+**Across cycles** is what `alert_after_failures` controls. A platform that stays down fails once per cycle, every cycle, so at the default of `1` an overnight top.gg outage is reported every cycle. Raise it and a step has to fail that many cycles in a row before it says anything:
 
-| `alert_after_failures` | What reaches the webhook                                                    |
+| `alert_after_failures` | What gets reported                                                          |
 | ---------------------- | --------------------------------------------------------------------------- |
 | `1` (default)          | Every failed cycle, immediately                                             |
 | `2`                    | Nothing until it has failed twice running — a single bad cycle stays silent |
@@ -158,7 +158,7 @@ Two separate things decide how much lands in your webhook, and they work at diff
 
 At `update_interval_minutes: 30`, setting `3` means roughly "don't tell me unless it has been broken for an hour and a half".
 
-It delays the *first* alert; it does not thin out the ones after it. Once a step has crossed the threshold it reports every failed cycle until it recovers, so a 12-hour top.gg outage at a 30-minute interval sends 22 messages with `3` instead of 24 with `1`. The setting is there to stop a one-off blip waking you, not to summarise an ongoing outage.
+It delays the *first* alert; it does not thin out the ones after it. Once a step has crossed the threshold it reports every failed cycle until it recovers, so a 12-hour top.gg outage at a 30-minute interval sends 22 reports with `3` instead of 24 with `1`. The setting is there to stop a one-off blip waking you, not to summarise an ongoing outage.
 
 The count is kept **per bot and per step**, so one bot failing does not bring another closer to alerting, and a failing top.gg post does not count towards the server-count step. Any success clears that step's count back to zero.
 
@@ -300,7 +300,7 @@ Errors are `{"error": "<code>"}` — `401 unauthorized` (on every path, includin
 
 `report_server_count: false` does not stop the servers being counted — that number still renames your channel and still appears above. It only controls what is sent to the listings, which is `detail.reporting`.
 
-No token or webhook URL appears in either mode, and error text is scrubbed before it is stored.
+No token or DSN appears in either mode, and error text is scrubbed before it is stored.
 
 ### Health
 
